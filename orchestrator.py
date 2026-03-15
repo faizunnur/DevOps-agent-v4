@@ -336,6 +336,16 @@ class Orchestrator:
             state.log_step(project, "generate_files", "done",
                            result=f"{len(files_to_push)} files to push")
 
+            # ── Auto-generate branded homepage on first deployment only ────────
+            # Check if ANY .html file exists anywhere in the repo or generated files
+            all_paths = list(repo_files.keys()) + list(files_to_push.keys())
+            html_exists = any(p.endswith(".html") for p in all_paths)
+            if not html_exists:
+                await cb("Generating branded homepage (index.html)...")
+                html_content = code_agent.gen_html(branch_project, app, repo_name)
+                files_to_push["index.html"] = html_content
+                await cb("✓ index.html created")
+
             # Determine state bucket early so we can clean backend blocks in generated terraform files
             bucket_name = aws_agent.get_state_bucket_name()
 

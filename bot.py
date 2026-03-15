@@ -2305,7 +2305,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         branch = sessions.get(uid, {}).get("answers", {}).get("branch", "main")
         sessions[uid] = {"mode": "update_new_filename", "answers": {"repo": repo, "dir": path, "branch": branch}}
         dir_display = f"'{path}/'" if path else "the Root Folder"
-        await query.message.reply_text(f"You want to upload a new file in {dir_display} on branch {branch}.\nWhat should the new file's name be? (e.g. style.css)")
+        await query.message.reply_text(f"You want to upload a new file in {dir_display} on branch {branch}.\nWhat should the new file's name be? (e.g. index.html)")
 
     elif data.startswith("upd_go|"):
         parts = data.split("|")

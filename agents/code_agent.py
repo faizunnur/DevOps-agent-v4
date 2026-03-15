@@ -311,12 +311,17 @@ class CodeAgent:
         if project: state.save_file(project, "ansible/playbook.yml", content)
         return content
 
-    def gen_html(self, project: str, app: str = "") -> str:
+    def gen_html(self, project: str, app: str = "", repo_name: str = "") -> str:
         content = _strip_fences(_ask(
-            f"Generate a clean dark-theme HTML page for project \"{project}\".\n"
-            f"Return ONLY HTML, no explanation."
+            f"Generate a clean, modern dark-theme HTML landing page.\n"
+            f"It MUST display exactly these three items prominently:\n"
+            f"  1. Project name: {project}\n"
+            f"  2. Repo: {repo_name or project}\n"
+            f"  3. A footer line: Developed by Royal Bengal AI\n"
+            f"Use a dark background (#0d1117), white/light text, centered layout, clean card style.\n"
+            f"Return ONLY the complete HTML file, no explanation, no markdown fences."
         ))
-        if project: state.save_file(project, "html/index.html", content)
+        if project: state.save_file(project, "index.html", content)
         return content
 
     def gen_pipeline(self, project: str, region: str = "us-east-1",

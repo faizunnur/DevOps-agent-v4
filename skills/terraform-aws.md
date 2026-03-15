@@ -24,6 +24,14 @@ terraform {
 The pipeline MUST pass: `-backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"`
 This ensures each project/branch gets its own isolated state.
 
+## GitHub Actions — ALWAYS install Terraform first
+GitHub Actions runners do NOT have Terraform pre-installed.
+Any job that runs terraform commands MUST include this step BEFORE any terraform run step:
+```yaml
+- uses: hashicorp/setup-terraform@v3
+```
+Missing this step causes: `terraform: command not found` (exit code 127).
+
 ## Provider
 ```hcl
 provider "aws" {
