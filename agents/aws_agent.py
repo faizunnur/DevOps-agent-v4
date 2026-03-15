@@ -21,10 +21,20 @@ logger = logging.getLogger(__name__)
 class AWSAgent:
 
     def __init__(self):
-        self.region = os.getenv("AWS_REGION", "us-east-1")
-        self.access_key = os.getenv("AWS_ACCESS_KEY_ID")
-        self.secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+        self.region        = os.getenv("AWS_REGION", "us-east-1")
+        self.access_key    = os.getenv("AWS_ACCESS_KEY_ID")
+        self.secret_key    = os.getenv("AWS_SECRET_ACCESS_KEY")
         self.session_token = os.getenv("AWS_SESSION_TOKEN")
+
+    @classmethod
+    def with_creds(cls, creds: dict) -> "AWSAgent":
+        """Return a new AWSAgent scoped to the given per-user credentials."""
+        inst               = cls.__new__(cls)
+        inst.region        = creds.get("aws_region") or os.getenv("AWS_REGION", "us-east-1")
+        inst.access_key    = creds.get("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+        inst.secret_key    = creds.get("aws_secret_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+        inst.session_token = creds.get("aws_session_token")
+        return inst
 
     def _ec2(self):
         return boto3.client(

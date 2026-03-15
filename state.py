@@ -59,6 +59,19 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+        # User credentials table — one row per Telegram user_id
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_credentials (
+            user_id             INTEGER PRIMARY KEY,
+            aws_access_key_id   TEXT,
+            aws_secret_key      TEXT,
+            aws_region          TEXT DEFAULT 'us-east-1',
+            github_token        TEXT,
+            github_username     TEXT,
+            updated_at          TEXT
+        )
+        """)
+
 
 def save_deployment(project, app, repo, cloud="AWS", region="us-east-1", branch="main"):
     now = datetime.utcnow().isoformat()
@@ -181,6 +194,63 @@ def list_projects():
     with _conn() as conn:
         rows = conn.execute("SELECT project, app, status, ec2_ip, updated_at FROM deployments ORDER BY updated_at DESC").fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Per-user credentials ──────────────────────────────────────────────────────
+
+def save_user_creds(user_id: int, creds: dict):
+    """Persist credentials for a Telegram user. Partial updates are supported."""
+    now = datetime.utcnow().isoformat()
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO user_credentials "
+            "(user_id, aws_access_key_id, aws_secret_key, aws_region, github_token, github_username, updated_at) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "aws_access_key_id=COALESCE(excluded.aws_access_key_id, aws_access_key_id), "
+            "aws_secret_key=COALESCE(excluded.aws_secret_key, aws_secret_key), "
+            "aws_region=COALESCE(excluded.aws_region, aws_region), "
+            "github_token=COALESCE(excluded.github_token, github_token), "
+            "github_username=COALESCE(excluded.github_username, github_username), "
+            "updated_at=excluded.updated_at",
+            (
+                user_id,
+                creds.get("aws_access_key_id"),
+                creds.get("aws_secret_key"),
+                creds.get("aws_region"),
+                creds.get("github_token"),
+                creds.get("github_username"),
+                now,
+            )
+        )
+
+
+def get_user_creds(user_id: int) -> dict | None:
+    """Return stored credentials for a user, or None if not set up."""
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM user_credentials WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_user_creds(user_id: int):
+    """Remove all stored credentials for a user."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM user_credentials WHERE user_id=?", (user_id,))
+
+
+def user_creds_complete(user_id: int) -> bool:
+    """Return True only if the user has all required credentials saved."""
+    creds = get_user_creds(user_id)
+    if not creds:
+        return False
+    return all([
+        creds.get("aws_access_key_id"),
+        creds.get("aws_secret_key"),
+        creds.get("github_token"),
+        creds.get("github_username"),
+    ])
 
 
 init_db()

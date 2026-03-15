@@ -525,7 +525,11 @@ class CodeAgent:
             f"     → In the deploy.yml file, find and REMOVE the `ANSIBLE_STDOUT_CALLBACK:` env var line completely. Nothing else.\n\n"
             f"  6. 'var.public_key' prompt / Terraform prompting interactively during destroy\n"
             f"     → In destroy.yml, find `-var=\"ssh_public_key=...\"` and change it to `-var=\"public_key=${{{{ secrets.SSH_PUBLIC_KEY }}}}\". Nothing else.\n\n"
-            f"  7. Any other error — quote the exact error line, fix only the line it points to.\n\n"
+            f"  7. `terraform: command not found` / exit code 127\n"
+            f"     → Add `- uses: hashicorp/setup-terraform@v3` as the FIRST step in every job that runs terraform commands.\n\n"
+            f"  8. Node.js 20 deprecation warning / `actions are running on Node.js 20`\n"
+            f"     → Add `env:\n  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` at the workflow top level (after `on:`, before `jobs:`). Nothing else.\n\n"
+            f"  9. Any other error — quote the exact error line, fix only the line it points to.\n\n"
 
             f"OUTPUT FORMAT:\n"
             f"FILE: <exact path>\n"
@@ -827,6 +831,7 @@ def _target_instructions(target: str, path: str) -> str:
         return (
             "- TRIGGER: Use ONLY `on: workflow_dispatch:`. NEVER USE `on: push:`.\n"
             "- Using `on: push:` causes duplicate runs which break state locks.\n"
+            "- NODE.JS 24: Every workflow MUST have `env:\n  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true` at the top level (after `on:`, before `jobs:`).\n"
         )
     return ""
 

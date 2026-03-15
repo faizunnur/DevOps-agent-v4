@@ -6,6 +6,14 @@ Always use ONLY `workflow_dispatch` so that the bot can trigger deployments exac
 on:
   workflow_dispatch:
 ```
+
+## Node.js 24 — ALWAYS required
+Every workflow MUST include this top-level `env:` block to suppress Node.js 20 deprecation warnings and ensure compatibility with Node.js 24 GitHub Actions runners:
+```yaml
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+```
+This must appear at the workflow level (not inside a job), after `on:` and before `jobs:`.
 ## Structure — always these jobs in order
 1. provision  — terraform (skip if EC2 exists)
 2. configure  — ansible

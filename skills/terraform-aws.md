@@ -32,6 +32,14 @@ Any job that runs terraform commands MUST include this step BEFORE any terraform
 ```
 Missing this step causes: `terraform: command not found` (exit code 127).
 
+## GitHub Actions — ALWAYS opt into Node.js 24
+Every workflow MUST include this top-level `env:` block to prevent Node.js 20 deprecation warnings:
+```yaml
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+```
+Place it after `on:` and before `jobs:`. This opts all actions (`actions/checkout`, `aws-actions/configure-aws-credentials`, `hashicorp/setup-terraform`, etc.) into the Node.js 24 runtime.
+
 ## Provider
 ```hcl
 provider "aws" {

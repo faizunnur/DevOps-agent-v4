@@ -19,6 +19,14 @@ class GitHubAgent:
         self.token    = os.getenv("GITHUB_TOKEN", "")
         self.username = os.getenv("GITHUB_USERNAME", "")
 
+    @classmethod
+    def with_creds(cls, creds: dict) -> "GitHubAgent":
+        """Return a new GitHubAgent scoped to the given per-user credentials."""
+        inst          = cls.__new__(cls)
+        inst.token    = creds.get("github_token") or os.getenv("GITHUB_TOKEN", "")
+        inst.username = creds.get("github_username") or os.getenv("GITHUB_USERNAME", "")
+        return inst
+
     def _gh(self):   return Github(self.token)
     def _user(self): return self._gh().get_user()
 

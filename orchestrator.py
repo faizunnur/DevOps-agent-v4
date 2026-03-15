@@ -8,8 +8,8 @@ import logging
 from typing import Callable, Optional
 
 import state
-from agents.aws_agent    import aws_agent
-from agents.github_agent import github_agent
+from agents.aws_agent    import aws_agent,    AWSAgent
+from agents.github_agent import github_agent, GitHubAgent
 from agents.code_agent   import code_agent
 from agents.error_agent  import error_agent
 
@@ -85,6 +85,36 @@ def _patch_terraform_bucket(files: dict, correct_bucket: str, correct_region: st
             files[path] = patched
             logger.info(f"_patch_terraform_bucket: cleaned backend block in {path}")
 
+
+
+def _inject_node24_env(wf_content: str) -> str:
+    """
+    Ensures every GitHub Actions workflow has `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true`
+    at the top-level `env:` block. Idempotent — skips if already present.
+    """
+    if "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24" in wf_content:
+        return wf_content  # already present
+
+    import re
+    # Insert after the `on:` block (before `jobs:`)
+    patched = re.sub(
+        r'(^jobs:\s*$)',
+        'env:\n  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true\n\n\\1',
+        wf_content,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if patched != wf_content:
+        return patched
+
+    # Fallback: prepend before the first line that starts with `jobs:`
+    lines = wf_content.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("jobs:"):
+            lines.insert(i, "env:\n  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true\n\n")
+            return "".join(lines)
+
+    return wf_content  # couldn't find insertion point — return unchanged
 
 
 def _extract_display_error(raw_log: str) -> str:
@@ -200,8 +230,12 @@ class Orchestrator:
         region:      str = "us-east-1",
         branch:      str = "main",
         target:      str = "ec2",
+        creds:       dict | None = None,
         progress_cb: Optional[Callable] = None,
     ) -> dict:
+        # Scope agents to per-user credentials if provided
+        _aws    = AWSAgent.with_creds(creds)    if creds else aws_agent
+        _github = GitHubAgent.with_creds(creds) if creds else github_agent
         self.resume(user_id)
         cb = progress_cb or (lambda m: None)
         # Use a holder so step() closure always uses the branch-scoped project name
@@ -230,17 +264,17 @@ class Orchestrator:
                 await cb(f"Project '{branch_project}' was previously deployed successfully.")
                 await cb(f"Skipping file generation — retriggering pipeline only...")
 
-                cancelled = github_agent.cancel_running_pipelines(repo_name)
+                cancelled = _github.cancel_running_pipelines(repo_name)
                 if cancelled.get("cancelled"):
                     await cb(f"Cancelled {len(cancelled['cancelled'])} running pipeline(s)")
                     await asyncio.sleep(5)
 
-                trigger_result = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
+                trigger_result = _github.trigger_pipeline(repo_name, "deploy.yml", branch)
                 if trigger_result.get("status") == "error":
                     raise Exception(f"Trigger failed: {trigger_result['error']}")
                 await cb(f"Pipeline triggered: {trigger_result.get('url')}")
 
-                pipeline = await github_agent.poll_pipeline(
+                pipeline = await _github.poll_pipeline(
                     repo_name, interval=30,
                     stop_flag=lambda: self.is_stopped(user_id),
                     progress_cb=cb,
@@ -254,7 +288,7 @@ class Orchestrator:
 
             # ── Step 1: AWS Prepare ───────────────────────────────────────────
             await step("aws_prepare", "Preparing AWS resources...")
-            aws_result = aws_agent.prepare(branch_project)
+            aws_result = _aws.prepare(branch_project)
 
             if "error" in aws_result.get("ssh", {}):
                 raise Exception(f"SSH key generation failed: {aws_result['ssh']['error']}")
@@ -285,12 +319,12 @@ class Orchestrator:
             self._check_stop(user_id)
             await step("github_setup", f"Setting up GitHub repo {repo_name}...")
 
-            repo_result = github_agent.create_repo(repo_name, f"DevOps Agent — {project}")
+            repo_result = _github.create_repo(repo_name, f"DevOps Agent — {project}")
             await cb(f"Repo: {repo_result.get('url', repo_name)}")
 
             # Create branch from main FIRST — so branch inherits all existing files
             if branch != "main":
-                br = github_agent.create_branch(repo_name, branch, "main")
+                br = _github.create_branch(repo_name, branch, "main")
                 await cb(f"Branch '{branch}' {br.get('status', 'ready')} (from main)")
 
             # ── Step 3: Files ─────────────────────────────────────────────────
@@ -298,7 +332,7 @@ class Orchestrator:
 
             # Read ALL existing files from the branch
             # (if branch was just created from main, it already has all main files)
-            repo_files = github_agent.get_existing_files(repo_name, branch=branch)
+            repo_files = _github.get_existing_files(repo_name, branch=branch)
             await cb(f"Found {len(repo_files)} files in branch '{branch}'")
 
             # Context-aware generation:
@@ -347,13 +381,17 @@ class Orchestrator:
                 await cb("✓ index.html created")
 
             # Determine state bucket early so we can clean backend blocks in generated terraform files
-            bucket_name = aws_agent.get_state_bucket_name()
+            bucket_name = _aws.get_state_bucket_name()
 
             if files_to_push:
                 # Ensure generated terraform files have no hardcoded backend bucket/region
                 _patch_terraform_bucket(files_to_push, bucket_name, region)
+                # Ensure all workflow files opt into Node.js 24 runtime
+                for wf_path in list(files_to_push.keys()):
+                    if wf_path.endswith(".yml") and ".github" in wf_path:
+                        files_to_push[wf_path] = _inject_node24_env(files_to_push[wf_path])
                 await cb(f"Pushing {len(files_to_push)} file(s) to '{branch}'...")
-                push_result = github_agent.push_files(repo_name, files_to_push, branch=branch)
+                push_result = _github.push_files(repo_name, files_to_push, branch=branch)
                 if push_result.get("failed"):
                     await cb(f"Warning: failed to push: {push_result['failed']}")
                 await cb(f"Pushed: {push_result.get('pushed', [])}")
@@ -362,7 +400,7 @@ class Orchestrator:
             for path in plan.get("delete", []):
                 try:
                     if hasattr(github_agent, "delete_file"):
-                        del_result = github_agent.delete_file(repo_name, path, branch=branch)
+                        del_result = _github.delete_file(repo_name, path, branch=branch)
                         await cb(f"Deleted {path}: {del_result.get('status', 'done')}")
                     else:
                         await cb(f"Skipping delete {path} (update github_agent to enable)")
@@ -371,8 +409,8 @@ class Orchestrator:
 
             # Ensure S3 terraform state bucket exists in THIS AWS account
             # Bucket name is auto-derived from account ID — different per account
-            bucket_name = aws_agent.get_state_bucket_name()
-            bucket_result = aws_agent.ensure_s3_bucket(bucket_name)
+            bucket_name = _aws.get_state_bucket_name()
+            bucket_result = _aws.ensure_s3_bucket(bucket_name)
             if bucket_result.get("created"):
                 await cb(f"✓ Created S3 bucket: {bucket_name}")
             elif bucket_result.get("error"):
@@ -393,7 +431,7 @@ class Orchestrator:
                 "TF_STATE_BUCKET":       bucket_name,
                 "SSH_USER":              os.getenv("SSH_USER", "ubuntu"),
             }
-            secret_result = github_agent.set_secrets(repo_name, secrets)
+            secret_result = _github.set_secrets(repo_name, secrets)
             await cb(f"Set {len(secret_result.get('set', []))} secrets")
             state.log_step(branch_project, "github_setup", "done")
 
@@ -401,13 +439,13 @@ class Orchestrator:
             self._check_stop(user_id)
             await step("trigger", "Checking for running pipelines...")
 
-            cancelled = github_agent.cancel_running_pipelines(repo_name)
+            cancelled = _github.cancel_running_pipelines(repo_name)
             if cancelled.get("cancelled"):
                 await cb(f"Cancelled {len(cancelled['cancelled'])} running pipeline(s)")
                 await asyncio.sleep(5)
 
             await cb(f"Triggering pipeline on branch '{branch}'...")
-            trigger_result = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
+            trigger_result = _github.trigger_pipeline(repo_name, "deploy.yml", branch)
             if trigger_result.get("status") == "error":
                 raise Exception(f"Trigger failed: {trigger_result['error']}")
             await cb(f"Pipeline triggered: {trigger_result.get('url')}")
@@ -425,7 +463,7 @@ class Orchestrator:
                 # Only poll on first iteration — retrigger handles subsequent ones
                 if retry > 0 and did_push_fix:
                     await cb(f"Retriggering pipeline (attempt {retry}/{MAX_RETRIES})...")
-                    trigger2 = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
+                    trigger2 = _github.trigger_pipeline(repo_name, "deploy.yml", branch)
                     if trigger2.get("status") == "error":
                         last_error = trigger2["error"]
                         await cb(f"Retrigger failed: {last_error}")
@@ -436,7 +474,7 @@ class Orchestrator:
 
                 if retry == 0 or did_push_fix:
                     await cb(f"Polling... (attempt {retry + 1}/{MAX_RETRIES + 1})")
-                    pipeline = await github_agent.poll_pipeline(
+                    pipeline = await _github.poll_pipeline(
                         repo_name,
                         interval=30,
                         branch=branch,
@@ -463,7 +501,7 @@ class Orchestrator:
                         if not ip and ec2.get("exists"):
                             ip = ec2.get("ip", "")
                         if not ip:
-                            fresh_ec2 = aws_agent.check_ec2(branch_project)
+                            fresh_ec2 = _aws.check_ec2(branch_project)
                             ip = fresh_ec2.get("ip", "")
                         url = f"http://{ip}" if ip else ""
                     state.update_deployment(branch_project, status="deployed", ec2_ip=ip)
@@ -501,7 +539,7 @@ class Orchestrator:
 
                 # Always read LIVE files from the actual branch — never trust local state
                 await cb(f"Reading current files from branch '{branch}'...")
-                repo_files_now = github_agent.get_existing_files(repo_name, branch=branch)
+                repo_files_now = _github.get_existing_files(repo_name, branch=branch)
 
                 # Sync to local state so fix_file reads the real current content
                 for path, fcontent in repo_files_now.items():
@@ -513,25 +551,43 @@ class Orchestrator:
                 # ── S3 403: wrong bucket — update secret + patch .tf, skip AI ──
                 combined_log = analysis.get("log_context", "") + analysis.get("full_log", "")
                 if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
-                    correct_bucket = aws_agent.get_state_bucket_name()
+                    correct_bucket = _aws.get_state_bucket_name()
                     await cb(f"S3 403 detected — wrong bucket in secret. Updating TF_STATE_BUCKET → {correct_bucket}")
-                    github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
+                    _github.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
                     # Also clean any hardcoded bucket from .tf files
                     _patch_terraform_bucket(repo_files_now, correct_bucket, region)
                     for path, fc in repo_files_now.items():
                         if path.endswith(".tf"):
-                            github_agent.push_single_file(
+                            _github.push_single_file(
                                 repo_name, path, fc,
                                 f"fix: clean hardcoded backend bucket (attempt {retry})",
                                 branch=branch,
                             )
                     await asyncio.sleep(3)
-                    trigger2 = github_agent.trigger_pipeline(repo_name, "deploy.yml", branch)
+                    trigger2 = _github.trigger_pipeline(repo_name, "deploy.yml", branch)
                     if trigger2.get("error"):
                         last_error = trigger2["error"]
                         break
                     await cb(f"Retriggering pipeline (attempt {retry}/{MAX_RETRIES})...")
                     continue
+
+                # ── Node.js 20 deprecation: inject FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 ──
+                if "Node.js 20" in combined_log or "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24" not in combined_log and "node_modules" not in combined_log and "actions are running on Node.js 20" in combined_log:
+                    patched_any_wf = False
+                    for wf_path, wf_content in list(repo_files_now.items()):
+                        if wf_path.endswith(".yml") and ".github" in wf_path:
+                            new_content = _inject_node24_env(wf_content)
+                            if new_content != wf_content:
+                                _github.push_single_file(
+                                    repo_name, wf_path, new_content,
+                                    f"fix: add FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 (attempt {retry})",
+                                    branch=branch,
+                                )
+                                await cb(f"Patched {wf_path} → Node.js 24")
+                                patched_any_wf = True
+                    if patched_any_wf:
+                        did_push_fix = True
+                        continue
 
                 # Pass live files directly so Claude sees exactly what's in the repo
                 fix_result = code_agent.analyze_and_fix(
@@ -555,7 +611,7 @@ class Orchestrator:
                     fx_path    = fx.get("file") or fix_result.get("file")
                     fx_content = fx.get("content") or fx.get("fixed_content")
                     if fx_path and fx_content:
-                        github_agent.push_single_file(
+                        _github.push_single_file(
                             repo_name, fx_path, fx_content,
                             f"fix: {fx.get('error','')[:60]} (attempt {retry})",
                             branch=branch,
@@ -575,7 +631,7 @@ class Orchestrator:
                     f"Change: {fix_result.get('diff_summary', '')}"
                 )
 
-                push = github_agent.push_single_file(
+                push = _github.push_single_file(
                     repo_name,
                     fix_result["file"],
                     fix_result["fixed_content"],
@@ -616,13 +672,15 @@ class Orchestrator:
         file_path:     str,
         fixed_content: str,
         retry:         int,
+        creds:         dict | None = None,
         progress_cb:   Optional[Callable] = None,
     ) -> dict:
+        _github = GitHubAgent.with_creds(creds) if creds else github_agent
         cb = progress_cb or (lambda m: None)
         self._check_stop(user_id)
 
         await cb(f"Pushing fix for {file_path}...")
-        push = github_agent.push_single_file(
+        push = _github.push_single_file(
             repo_name, file_path, fixed_content,
             f"Fix: {file_path} (attempt {retry})"
         )
@@ -630,17 +688,17 @@ class Orchestrator:
             return {"status": "error", "message": f"Push failed: {push['failed']}"}
 
         await cb("Waiting for any running pipelines...")
-        github_agent.wait_for_idle(repo_name, timeout=120)
+        _github.wait_for_idle(repo_name, timeout=120)
 
         await cb("Retriggering pipeline...")
-        trigger = github_agent.trigger_pipeline(repo_name, "deploy.yml")
+        trigger = _github.trigger_pipeline(repo_name, "deploy.yml")
         if trigger.get("status") == "error":
             return {"status": "error", "message": trigger["error"]}
 
         await cb(f"Pipeline retriggered: {trigger.get('url')}")
         state.log_step(project, f"fix_{retry}", "done")
 
-        pipeline = await github_agent.poll_pipeline(
+        pipeline = await _github.poll_pipeline(
             repo_name,
             interval=30,
             stop_flag=lambda: self.is_stopped(user_id),
@@ -663,8 +721,10 @@ class Orchestrator:
         repo_name:   str,
         file_path:   str,
         content:     str,
+        creds:       dict | None = None,
         progress_cb: Optional[Callable] = None,
     ) -> dict:
+        _github = GitHubAgent.with_creds(creds) if creds else github_agent
         self.resume(user_id)
         cb = progress_cb or (lambda m: None)
 
@@ -673,24 +733,24 @@ class Orchestrator:
             await cb(f"Pushing {file_path} to {repo_name}...")
             state.save_file(project, file_path, content)
 
-            push = github_agent.push_single_file(repo_name, file_path, content)
+            push = _github.push_single_file(repo_name, file_path, content)
             if push.get("failed"):
                 return {"status": "error", "message": str(push["failed"])}
 
             await cb("File pushed. Triggering pipeline...")
 
-            cancelled = github_agent.cancel_running_pipelines(repo_name)
+            cancelled = _github.cancel_running_pipelines(repo_name)
             if cancelled.get("cancelled"):
                 await cb(f"Cancelled {len(cancelled['cancelled'])} running pipeline(s)")
                 await asyncio.sleep(5)
 
-            trigger = github_agent.trigger_pipeline(repo_name, "deploy.yml")
+            trigger = _github.trigger_pipeline(repo_name, "deploy.yml")
             if trigger.get("status") == "error":
                 return {"status": "error", "message": trigger["error"]}
 
             await cb(f"Pipeline triggered: {trigger.get('url')}")
 
-            pipeline = await github_agent.poll_pipeline(
+            pipeline = await _github.poll_pipeline(
                 repo_name,
                 interval=30,
                 stop_flag=lambda: self.is_stopped(user_id),
@@ -719,8 +779,12 @@ class Orchestrator:
         branch:      str = "main",
         delete_repo: bool = False,
         delete_branch: bool = False,
+        creds:       dict | None = None,
         progress_cb: Optional[Callable] = None,
     ) -> dict:
+        # Scope agents to per-user credentials if provided
+        _aws    = AWSAgent.with_creds(creds)    if creds else aws_agent
+        _github = GitHubAgent.with_creds(creds) if creds else github_agent
         self.resume(user_id)
         cb = progress_cb or (lambda m: None)
 
@@ -731,19 +795,19 @@ class Orchestrator:
             await cb(f"Destroying project '{project}' from branch '{deploy_branch}'...")
 
             # Patch terraform files on that branch with correct bucket before destroying
-            bucket_name = aws_agent.get_state_bucket_name()
+            bucket_name = _aws.get_state_bucket_name()
             dep         = state.get_deployment(project) or {}
             region      = dep.get("region", "us-east-1")
 
             # Ensure S3 bucket exists in this account
-            aws_agent.ensure_s3_bucket(bucket_name)
+            _aws.ensure_s3_bucket(bucket_name)
 
             # Patch terraform backend on the deploy branch before triggering destroy
-            branch_files = github_agent.get_existing_files(repo_name, branch=deploy_branch)
+            branch_files = _github.get_existing_files(repo_name, branch=deploy_branch)
             _patch_terraform_bucket(branch_files, bucket_name, region)
             for path, fc in branch_files.items():
                 if path.endswith(".tf"):
-                    github_agent.push_single_file(
+                    _github.push_single_file(
                         repo_name, path, fc,
                         f"fix: update terraform backend for destroy",
                         branch=deploy_branch,
@@ -751,7 +815,7 @@ class Orchestrator:
                     await cb(f"Patched {path} → bucket: {bucket_name}")
 
             # Cancel any running pipelines first
-            cancelled = github_agent.cancel_running_pipelines(repo_name)
+            cancelled = _github.cancel_running_pipelines(repo_name)
             if cancelled.get("cancelled"):
                 await cb(f"Cancelled {len(cancelled['cancelled'])} running pipeline(s)")
                 await asyncio.sleep(5)
@@ -765,7 +829,7 @@ class Orchestrator:
                 
                 if did_push_fix:
                     await cb(f"Triggering destroy pipeline on branch '{deploy_branch}'... (attempt {retry + 1})")
-                    trigger = github_agent.trigger_pipeline(repo_name, "destroy.yml",
+                    trigger = _github.trigger_pipeline(repo_name, "destroy.yml",
                                                             branch=deploy_branch)
                     if trigger.get("status") == "error":
                         await cb(f"Trigger failed: {trigger['error']}")
@@ -775,7 +839,7 @@ class Orchestrator:
                     await cb(f"Retrying AI auto-fix (pipeline not retriggered)...")
 
                 if did_push_fix:
-                    pipeline = await github_agent.poll_pipeline(
+                    pipeline = await _github.poll_pipeline(
                         repo_name,
                         interval=30,
                         stop_flag=lambda: self.is_stopped(user_id),
@@ -789,8 +853,8 @@ class Orchestrator:
 
                 if pipeline.get("conclusion") == "success":
                     await cb("Destroy succeeded — cleaning up SSM and S3...")
-                    aws_agent.delete_ssm_keys(project)
-                    aws_agent.delete_s3_state(project)
+                    _aws.delete_ssm_keys(project)
+                    _aws.delete_s3_state(project)
                     state.update_deployment(project, status="destroyed")
                     state.log_step(project, "destroy", "done")
 
@@ -809,47 +873,47 @@ class Orchestrator:
                             await cb(f"  → Destroying branch '{br_branch}' ({br_project})...")
                             try:
                                 # Patch terraform files on that branch
-                                br_files = github_agent.get_existing_files(repo_name, branch=br_branch)
+                                br_files = _github.get_existing_files(repo_name, branch=br_branch)
                                 _patch_terraform_bucket(br_files, bucket_name, dep_rec.get("region", region))
                                 for fpath, fc in br_files.items():
                                     if fpath.endswith(".tf"):
-                                        github_agent.push_single_file(
+                                        _github.push_single_file(
                                             repo_name, fpath, fc,
                                             "fix: update terraform backend for full-repo destroy",
                                             branch=br_branch,
                                         )
                                 # Trigger destroy pipeline on that branch
-                                trig = github_agent.trigger_pipeline(repo_name, "destroy.yml", branch=br_branch)
+                                trig = _github.trigger_pipeline(repo_name, "destroy.yml", branch=br_branch)
                                 if trig.get("status") == "error":
                                     await cb(f"    Could not trigger destroy for '{br_branch}': {trig.get('error')} — skipping")
                                     continue
                                 await cb(f"    Pipeline triggered: {trig.get('url', '')}")
-                                br_pipeline = await github_agent.poll_pipeline(
+                                br_pipeline = await _github.poll_pipeline(
                                     repo_name,
                                     interval=30,
                                     stop_flag=lambda: self.is_stopped(user_id),
                                     progress_cb=cb,
                                 )
                                 if br_pipeline.get("conclusion") == "success":
-                                    aws_agent.delete_ssm_keys(br_project)
-                                    aws_agent.delete_s3_state(br_project)
+                                    _aws.delete_ssm_keys(br_project)
+                                    _aws.delete_s3_state(br_project)
                                     state.update_deployment(br_project, status="destroyed")
                                     state.log_step(br_project, "destroy", "done")
                                     await cb(f"    ✓ Branch '{br_branch}' AWS resources destroyed")
                                 else:
                                     await cb(f"    ⚠ Branch '{br_branch}' destroy pipeline did not succeed — cleaning up state anyway")
-                                    aws_agent.delete_ssm_keys(br_project)
-                                    aws_agent.delete_s3_state(br_project)
+                                    _aws.delete_ssm_keys(br_project)
+                                    _aws.delete_s3_state(br_project)
                                     state.update_deployment(br_project, status="destroyed")
                             except Exception as e_br:
                                 await cb(f"    ⚠ Error destroying branch '{br_branch}': {e_br} — continuing")
 
                         await cb("Deleting GitHub repo...")
-                        github_agent.cleanup(repo_name, delete_repo=True)
+                        _github.cleanup(repo_name, delete_repo=True)
                     elif delete_branch and branch != "main":
                         await cb(f"Deleting branch '{branch}'...")
                         try:
-                            github_agent.delete_branch(repo_name, branch)
+                            _github.delete_branch(repo_name, branch)
                         except Exception as e:
                             await cb(f"Could not delete branch: {e}")
 
@@ -866,7 +930,7 @@ class Orchestrator:
                 await cb(f"Destroy pipeline failed — fixing (retry {retry}/{MAX_DESTROY_RETRIES})...")
 
                 # Fetch latest files from the DEPLOY branch (not main)
-                repo_files_now = github_agent.get_existing_files(repo_name, branch=deploy_branch)
+                repo_files_now = _github.get_existing_files(repo_name, branch=deploy_branch)
                 for path, fcontent in repo_files_now.items():
                     if path and fcontent:  # guard against None/empty paths from GitHub API tree objects
                         state.save_file(project, path, fcontent)
@@ -877,15 +941,15 @@ class Orchestrator:
                     j.get("log", "") for j in pipeline.get("all_jobs", [])
                 )
                 if ("403" in combined_log or "AccessDenied" in combined_log or "Access Denied" in combined_log) and ("tfstate" in combined_log.lower() or "ListObjects" in combined_log or "HeadObject" in combined_log):
-                    correct_bucket = aws_agent.get_state_bucket_name()
+                    correct_bucket = _aws.get_state_bucket_name()
                     await cb(f"S3 403 detected — updating TF_STATE_BUCKET secret → {correct_bucket}")
                     # Update secret so pipeline uses correct bucket on retry
-                    github_agent.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
+                    _github.set_secrets(repo_name, {"TF_STATE_BUCKET": correct_bucket})
                     # Clean any hardcoded bucket from .tf files
                     _patch_terraform_bucket(repo_files_now, correct_bucket, region)
                     for path, fc in repo_files_now.items():
                         if path.endswith(".tf"):
-                            github_agent.push_single_file(
+                            _github.push_single_file(
                                 repo_name, path, fc,
                                 f"fix: correct S3 backend bucket for destroy attempt {retry}",
                                 branch=deploy_branch,
@@ -916,7 +980,7 @@ class Orchestrator:
                     if not fix.get("file"):
                         continue
                     await cb(f"Fixed {fix['file']}: {fix.get('diff_summary','')}")
-                    push = github_agent.push_single_file(
+                    push = _github.push_single_file(
                         repo_name,
                         fix["file"],
                         fix["fixed_content"],

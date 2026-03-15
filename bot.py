@@ -14,8 +14,8 @@ load_dotenv(override=True)
 
 from orchestrator import orchestrator
 from agents.code_agent   import code_agent
-from agents.github_agent import github_agent
-from agents.aws_agent    import aws_agent
+from agents.github_agent import github_agent, GitHubAgent
+from agents.aws_agent    import aws_agent,    AWSAgent
 from skills import list_skills, add_skill, delete_skill
 import state
 
@@ -25,7 +25,12 @@ _log_handler.stream.reconfigure(encoding='utf-8', errors='replace') if hasattr(_
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", handlers=[_log_handler])
 logger = logging.getLogger(__name__)
 
-ALLOWED_USER = int(os.getenv("TELEGRAM_ALLOWED_USER", "0"))
+def _agents(uid: int):
+    """Return (github_agent, aws_agent) scoped to this user's stored credentials."""
+    creds = state.get_user_creds(uid)
+    if creds:
+        return GitHubAgent.with_creds(creds), AWSAgent.with_creds(creds)
+    return github_agent, aws_agent
 
 sessions: dict[int, dict] = {}
 running:  dict[int, bool] = {}
@@ -244,9 +249,59 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  trigger pipeline in my-repo\n"
         "  destroy my-repo\n\n"
         "Commands:\n"
+        "  /setup /mysetup\n"
         "  /deploy /update /destroy /trigger /status /projects\n"
         "  /code /github /aws /skills /list\n"
-        "  /stop /reset"
+        "  /stop /reset\n\n"
+        "⚠️ Run /setup first to provide your AWS & GitHub credentials."
+    )
+
+async def cmd_setup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    sessions[uid] = {"mode": "setup_aws_key"}
+    await update.message.reply_text(
+        "🔧 *Credential Setup* (your credentials are stored securely and never shared)\n\n"
+        "Step 1/5 — Enter your *AWS Access Key ID*:",
+        parse_mode="Markdown",
+    )
+
+async def cmd_mysetup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    creds = state.get_user_creds(uid)
+    if not creds:
+        await update.message.reply_text("No credentials saved. Run /setup to configure them.")
+        return
+    complete = state.user_creds_complete(uid)
+    status = "✅ Complete" if complete else "⚠️ Incomplete — run /setup again"
+    aws_key = creds.get("aws_access_key_id") or ""
+    masked_key = (aws_key[:4] + "****" + aws_key[-4:]) if len(aws_key) >= 8 else ("****" if aws_key else "—")
+    await update.message.reply_text(
+        f"🔑 *Your Credentials* — {status}\n\n"
+        f"AWS Key ID  : `{masked_key}`\n"
+        f"AWS Secret  : `{'****' if creds.get('aws_secret_key') else '—'}`\n"
+        f"AWS Region  : `{creds.get('aws_region') or '—'}`\n"
+        f"GitHub Token: `{'****' if creds.get('github_token') else '—'}`\n"
+        f"GitHub User : `{creds.get('github_username') or '—'}`\n\n"
+        "Run /setup to update credentials.",
+        parse_mode="Markdown",
+    )
+
+async def cmd_deletecreds(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    creds = state.get_user_creds(uid)
+    if not creds:
+        await update.message.reply_text("You have no saved credentials to delete.")
+        return
+    keyboard = [
+        [InlineKeyboardButton("🗑️ Yes, delete my credentials", callback_data="delcreds|confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="delcreds|cancel")],
+    ]
+    await update.message.reply_text(
+        "⚠️ *Delete your credentials?*\n\n"
+        "This will remove your AWS and GitHub credentials from the bot. "
+        "You will need to run /setup again to use deploy features.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -428,11 +483,12 @@ async def cmd_destroy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     args = ctx.args
+    gh, _aw = _agents(uid)
     if args:
         repo = args[0]
         workflow = args[1] if len(args) > 1 else "deploy.yml"
         await update.message.reply_text(f"Triggering {workflow} in {repo}...")
-        r = github_agent.handle("trigger", {"repo": repo, "workflow": workflow})
+        r = gh.handle("trigger", {"repo": repo, "workflow": workflow})
         await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
     else:
         sessions[uid] = {"mode": "trigger_repo", "answers": {}}
@@ -517,6 +573,7 @@ async def cmd_code(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     uid  = update.effective_user.id
+    gh, _aw = _agents(uid)
 
     # No args — start conversational menu
     if not args:
@@ -543,13 +600,13 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = args[0].lower()
 
     if action == "create":
-        r = github_agent.handle("create_repo", {"name": args[1]})
+        r = gh.handle("create_repo", {"name": args[1]})
         await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
     elif action == "delete":
-        r = github_agent.handle("delete_repo", {"name": args[1]})
+        r = gh.handle("delete_repo", {"name": args[1]})
         await update.message.reply_text(f"Delete: {r.get('status')}")
     elif action == "list":
-        r = github_agent.handle("list_repos", {})
+        r = gh.handle("list_repos", {})
         lines = [f"{x['name']} — {x['url']}" for x in r.get("repos",[])[:15]]
         await update.message.reply_text("Repos:\n" + "\n".join(lines) if lines else "No repos")
     elif action == "files":
@@ -558,7 +615,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sessions[uid] = {"mode": "gh_files_repo", "answers": {}}
             await update.message.reply_text("Repo name?")
             return
-        files = github_agent.get_existing_files(repo)
+        files = gh.get_existing_files(repo)
         lines = list(files.keys())
         await update.message.reply_text(f"Files in {repo}:\n" + "\n".join(f"  {f}" for f in lines) if lines else "Empty repo")
     elif action == "pull":
@@ -572,7 +629,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sessions[uid] = {"mode": "gh_pull_file", "answers": {"repo": repo}}
             await update.message.reply_text("File path? (e.g. html/index.html)")
             return
-        files = github_agent.get_existing_files(repo)
+        files = gh.get_existing_files(repo)
         cnt   = files.get(file, "")
         await (_send_long(update, f"```\n{cnt[:3500]}\n```") if cnt else update.message.reply_text(f"Not found: {file}"))
     elif action == "push":
@@ -591,7 +648,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "secrets":
         repo    = args[1] if len(args)>1 else ""
         secrets = dict(kv.split("=",1) for kv in args[2:] if "=" in kv)
-        r = github_agent.handle("set_secrets", {"repo": repo, "secrets": secrets})
+        r = gh.handle("set_secrets", {"repo": repo, "secrets": secrets})
         await update.message.reply_text(f"Set: {r.get('set', r.get('error'))}")
     elif action == "trigger":
         repo     = args[1] if len(args)>1 else ""
@@ -600,7 +657,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sessions[uid] = {"mode": "gh_trigger_repo", "answers": {}}
             await update.message.reply_text("Repo name?")
             return
-        r = github_agent.trigger_pipeline(repo, workflow)
+        r = gh.trigger_pipeline(repo, workflow)
         await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
     elif action == "status":
         repo = args[1] if len(args)>1 else ""
@@ -608,7 +665,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sessions[uid] = {"mode": "gh_status_repo", "answers": {}}
             await update.message.reply_text("Repo name?")
             return
-        r = github_agent.get_pipeline_status(repo)
+        r = gh.get_pipeline_status(repo)
         await update.message.reply_text(f"Status: {r.get('status')}\nConclusion: {r.get('conclusion','...')}\n{r.get('run_url','')}")
     elif action == "logs":
         repo = args[1] if len(args)>1 else ""
@@ -616,7 +673,7 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sessions[uid] = {"mode": "gh_logs_repo", "answers": {}}
             await update.message.reply_text("Repo name?")
             return
-        result = github_agent.get_pipeline_status(repo)
+        result = gh.get_pipeline_status(repo)
         for job in result.get("failed_jobs", [])[:2]:
             await _send_long(update, f"=== {job['name']} ===\n{job.get('log','')[-2000:]}")
         if not result.get("failed_jobs"):
@@ -625,6 +682,8 @@ async def cmd_github(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_aws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
+    uid  = update.effective_user.id
+    _gh, aw = _agents(uid)
     if not args:
         await update.message.reply_text(
             "/aws check <project>\n/aws list\n/aws sshkey <project>\n"
@@ -633,25 +692,25 @@ async def cmd_aws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     action = args[0].lower()
     if action == "check":
-        r = aws_agent.handle("check_ec2", {"project": args[1]})
+        r = aw.handle("check_ec2", {"project": args[1]})
         await update.message.reply_text(f"EC2: {r['ip']}" if r.get("exists") else f"No EC2 for {args[1]}")
     elif action == "list":
-        r = aws_agent.handle("list_ec2", {})
+        r = aw.handle("list_ec2", {})
         lines = [f"{i['project'] or 'unknown'}: {i['ip']} ({i['type']})" for i in r.get("instances",[])]
         await update.message.reply_text("Running:\n" + "\n".join(lines) if lines else "No instances")
     elif action == "sshkey":
-        r = aws_agent.handle("gen_ssh_key", {"project": args[1]})
+        r = aw.handle("gen_ssh_key", {"project": args[1]})
         await update.message.reply_text("SSH key generated" if "error" not in r else f"Error: {r['error']}")
     elif action == "s3":
-        r = aws_agent.handle("ensure_s3", {})
+        r = aw.handle("ensure_s3", {})
         await update.message.reply_text(f"S3: {r.get('bucket')} — {'exists' if r.get('exists') else 'created'}")
     elif action == "cleanup":
-        r = aws_agent.handle("cleanup", {"project": args[1]})
+        r = aw.handle("cleanup", {"project": args[1]})
         await update.message.reply_text(f"Cleaned: {r}")
     elif action == "creds":
-        r     = aws_agent.handle("credentials", {})
-        creds = r.get("credentials", {})
-        await update.message.reply_text(f"Key: {creds.get('AWS_ACCESS_KEY_ID','')[:8]}...\nRegion: {creds.get('AWS_REGION')}")
+        r     = aw.handle("credentials", {})
+        creds_info = r.get("credentials", {})
+        await update.message.reply_text(f"Key: {creds_info.get('AWS_ACCESS_KEY_ID','')[:8]}...\nRegion: {creds_info.get('AWS_REGION')}")
 
 
 async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -662,6 +721,7 @@ async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     uid  = update.effective_user.id
     args = ctx.args
+    _gh, aw = _agents(uid)
 
     if not args:
         await update.message.reply_text(
@@ -675,7 +735,7 @@ async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     action = args[0].lower()
 
     if action == "list":
-        r = aws_agent.list_tf_states()
+        r = aw.list_tf_states()
         if "error" in r:
             await update.message.reply_text(f"❌ {r['error']}")
             return
@@ -696,7 +756,7 @@ async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         project = args[1]
         await update.message.reply_text(f"🧹 Clearing Terraform state for `{project}`...")
-        r = aws_agent.clear_tf_state(project)
+        r = aw.clear_tf_state(project)
         if r.get("deleted"):
             lines = [f"✅ Deleted {len(r['deleted'])} object(s) from `{r['bucket']}`:"]
             for k in r["deleted"]:
@@ -712,7 +772,7 @@ async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif action == "nuke":
         # Ask for confirmation first
         sessions[uid] = {"mode": "confirm_nuke_s3"}
-        bucket = aws_agent.get_state_bucket_name()
+        bucket = aw.get_state_bucket_name()
         await update.message.reply_text(
             f"⚠️ WARNING: This will delete ALL objects in `{bucket}` and remove the bucket.\n"
             f"This affects ALL projects' Terraform state.\n\n"
@@ -752,10 +812,7 @@ async def cmd_delskill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid  = update.effective_user.id
     text = update.message.text.strip()
-
-    if ALLOWED_USER and uid != ALLOWED_USER:
-        await update.message.reply_text("Unauthorized.")
-        return
+    gh, aw = _agents(uid)
 
     if is_running(uid):
         await update.message.reply_text("Job running. /stop to cancel.")
@@ -763,6 +820,39 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     sess = sessions.get(uid, {})
     mode = sess.get("mode", "")
+
+    # ── Credential Setup Flow ─────────────────────────────────────────────────
+    if mode.startswith("setup_"):
+        pending = sess.get("pending_creds", {})
+        if mode == "setup_aws_key":
+            pending["aws_access_key_id"] = text.strip()
+            sessions[uid] = {"mode": "setup_aws_secret", "pending_creds": pending}
+            await update.message.reply_text("Step 2/5 — Enter your *AWS Secret Access Key*:", parse_mode="Markdown")
+        elif mode == "setup_aws_secret":
+            pending["aws_secret_key"] = text.strip()
+            sessions[uid] = {"mode": "setup_aws_region", "pending_creds": pending}
+            await update.message.reply_text(
+                "Step 3/5 — Enter your *AWS Region* (e.g. `us-east-1`), or send `skip` for default (`us-east-1`):",
+                parse_mode="Markdown",
+            )
+        elif mode == "setup_aws_region":
+            pending["aws_region"] = "us-east-1" if text.strip().lower() == "skip" else text.strip()
+            sessions[uid] = {"mode": "setup_github_token", "pending_creds": pending}
+            await update.message.reply_text("Step 4/5 — Enter your *GitHub Personal Access Token*:", parse_mode="Markdown")
+        elif mode == "setup_github_token":
+            pending["github_token"] = text.strip()
+            sessions[uid] = {"mode": "setup_github_username", "pending_creds": pending}
+            await update.message.reply_text("Step 5/5 — Enter your *GitHub Username*:", parse_mode="Markdown")
+        elif mode == "setup_github_username":
+            pending["github_username"] = text.strip()
+            state.save_user_creds(uid, pending)
+            sessions.pop(uid, None)
+            await update.message.reply_text(
+                "✅ *Credentials saved!* Validating them now — please wait...",
+                parse_mode="Markdown",
+            )
+            asyncio.create_task(_validate_credentials(update, uid, pending))
+        return
 
     # ── Repo Name Validation ──────────────────────────────────────────────────
     # Check for space in repo name during repo prompt flows
@@ -792,7 +882,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  "pr","merge","list","create","delete","secrets")
         if action in valid:
             if action == "list":
-                r = github_agent.handle("list_repos", {})
+                r = gh.handle("list_repos", {})
                 lines = [f"{x['name']} — {x['url']}" for x in r.get("repos",[])[:15]]
                 await update.message.reply_text("Repos:\n" + "\n".join(lines) if lines else "No repos")
                 sessions.pop(uid, None)
@@ -823,7 +913,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         from_branch = text.strip() or "main"
         repo   = sess["answers"]["repo"]
         branch = sess["answers"]["branch"]
-        r      = github_agent.create_branch(repo, branch, from_branch)
+        r      = gh.create_branch(repo, branch, from_branch)
         sessions.pop(uid, None)
         await update.message.reply_text(
             f"Branch '{branch}' {r.get('status')} in {repo}" if "error" not in r
@@ -833,12 +923,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "gh_branches_repo":
         repo = text.strip()
-        sessions.pop(uid, None)
-        r    = github_agent.list_branches(repo)
+        r    = gh.list_branches(repo)
         branches = r.get("branches", [])
+        if r.get("status") == "error" or not branches:
+            await _repo_not_found(update, uid, repo, gh, "gh_branches_repo", "Please enter the correct repo name:")
+            return
+        sessions.pop(uid, None)
         await update.message.reply_text(
             f"Branches in {repo}:\n" + "\n".join(f"  {b}" for b in branches)
-            if branches else f"No branches found or error: {r.get('error')}"
         )
         return
 
@@ -863,7 +955,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "gh_pr_title":
         title = text.strip() or None
-        r     = github_agent.create_pull_request(
+        r     = gh.create_pull_request(
             sess["answers"]["repo"],
             sess["answers"]["from"],
             sess["answers"]["to"],
@@ -890,7 +982,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "gh_merge_to":
-        r = github_agent.merge_branch(
+        r = gh.merge_branch(
             sess["answers"]["repo"],
             sess["answers"]["from"],
             text.strip(),
@@ -903,7 +995,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "gh_push_repo":
-        sess["answers"]["repo"] = text.strip()
+        repo = text.strip()
+        r = gh.list_branches(repo)
+        if r.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_push_repo", "Please enter the correct repo name:")
+            return
+        sess["answers"]["repo"] = repo
         sessions[uid] = {"mode": "gh_push_file", "answers": sess["answers"]}
         await update.message.reply_text("File path? (e.g. html/index.html)")
         return
@@ -917,7 +1014,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "gh_push_content":
         repo = sess["answers"]["repo"]
         file = sess["answers"]["file"]
-        r    = github_agent.push_single_file(repo, file, text, f"Update: {file}")
+        r    = gh.push_single_file(repo, file, text, f"Update: {file}")
         sessions.pop(uid, None)
         pushed = r.get("pushed", [])
         failed = r.get("failed", [])
@@ -931,7 +1028,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "gh_push_trigger":
         if text.strip().lower() in ("yes", "y"):
             repo = sess["answers"]["repo"]
-            r    = github_agent.trigger_pipeline(repo, "deploy.yml")
+            r    = gh.trigger_pipeline(repo, "deploy.yml")
             await update.message.reply_text(f"Pipeline triggered: {r.get('url', r.get('error',''))}")
         else:
             await update.message.reply_text("Done — pipeline not triggered.")
@@ -939,7 +1036,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "gh_pull_repo":
-        sess["answers"]["repo"] = text.strip()
+        repo = text.strip()
+        r = gh.list_branches(repo)
+        if r.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_pull_repo", "Please enter the correct repo name:")
+            return
+        sess["answers"]["repo"] = repo
         sessions[uid] = {"mode": "gh_pull_file", "answers": sess["answers"]}
         await update.message.reply_text("File path?")
         return
@@ -947,33 +1049,56 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "gh_pull_file":
         repo  = sess["answers"]["repo"]
         file  = text.strip()
-        files = github_agent.get_existing_files(repo)
+        files = gh.get_existing_files(repo)
         cnt   = files.get(file, "")
         sessions.pop(uid, None)
         if cnt:
             await _send_long(update, f"```\n{cnt[:3500]}\n```")
         else:
-            await update.message.reply_text(f"Not found: {file}\nFiles: {list(files.keys())[:10]}")
+            # File not found — show available files
+            file_list = list(files.keys())
+            keyboard = [[InlineKeyboardButton("📋 Show all files", callback_data=f"show_files|{repo}")]]
+            await update.message.reply_text(
+                f"❌ File `{file}` not found in `{repo}`.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            if file_list:
+                await update.message.reply_text(
+                    f"Files in {repo}:\n" + "\n".join(f"  • {f}" for f in file_list[:20])
+                )
         return
 
     if mode == "gh_trigger_repo":
         repo = text.strip()
+        r_br = gh.list_branches(repo)
+        if r_br.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_trigger_repo", "Please enter the correct repo name:")
+            return
         sessions.pop(uid, None)
-        r = github_agent.trigger_pipeline(repo, "deploy.yml")
+        r = gh.trigger_pipeline(repo, "deploy.yml")
         await update.message.reply_text(f"Pipeline triggered: {r.get('url', r.get('error',''))}")
         return
 
     if mode == "gh_status_repo":
         repo = text.strip()
+        r_br = gh.list_branches(repo)
+        if r_br.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_status_repo", "Please enter the correct repo name:")
+            return
         sessions.pop(uid, None)
-        r = github_agent.get_pipeline_status(repo)
-        await update.message.reply_text(f"Status: {r.get('status')}\nConclusion: {r.get('conclusion','...')}\n{r.get('run_url','')}")
+        r = gh.get_pipeline_status(repo)
+        await update.message.reply_text(f"Status: {r.get('status')}\nConclusion: {r.get('conclusion','...')}\n{r.get('run_url','')}") 
         return
 
     if mode == "gh_logs_repo":
-        repo   = text.strip()
+        repo = text.strip()
+        r_br = gh.list_branches(repo)
+        if r_br.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_logs_repo", "Please enter the correct repo name:")
+            return
         sessions.pop(uid, None)
-        result = github_agent.get_pipeline_status(repo)
+        result = gh.get_pipeline_status(repo)
         for job in result.get("failed_jobs", [])[:2]:
             await _send_long(update, f"=== {job['name']} ===\n{job.get('log','')[-2000:]}")
         if not result.get("failed_jobs"):
@@ -982,23 +1107,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "gh_files_repo":
         repo  = text.strip()
+        r_br = gh.list_branches(repo)
+        if r_br.get("status") == "error":
+            await _repo_not_found(update, uid, repo, gh, "gh_files_repo", "Please enter the correct repo name:")
+            return
         sessions.pop(uid, None)
-        files = github_agent.get_existing_files(repo)
+        files = gh.get_existing_files(repo)
         lines = list(files.keys())
-        await update.message.reply_text(f"Files in {repo}:\n" + "\n".join(f"  {f}" for f in lines) if lines else "Empty repo")
+        await update.message.reply_text(f"Files in {repo}:\n" + "\n".join(f"  • {f}" for f in lines) if lines else f"Repo `{repo}` appears to be empty.")
         return
 
     if mode == "gh_create_repo":
         repo = text.strip()
         sessions.pop(uid, None)
-        r = github_agent.handle("create_repo", {"name": repo})
+        r = gh.handle("create_repo", {"name": repo})
         await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
         return
 
     if mode == "gh_delete_repo":
         repo = text.strip()
         sessions.pop(uid, None)
-        r = github_agent.handle("delete_repo", {"name": repo})
+        r = gh.handle("delete_repo", {"name": repo})
         await update.message.reply_text(f"Delete: {r.get('status')}")
         return
 
@@ -1015,7 +1144,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         to_branch = text.strip()
         repo      = sess["answers"]["repo"]
         from_b    = sess["answers"]["branch"]
-        r         = github_agent.create_pull_request(repo, from_b, to_branch)
+        r         = gh.create_pull_request(repo, from_b, to_branch)
         sessions.pop(uid, None)
         if r.get("status") in ("created", "exists"):
             await update.message.reply_text(f"PR created: {r['url']}")
@@ -1024,7 +1153,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if mode == "github_push":
-        r = github_agent.handle("push_file", {"repo": sess["repo"], "path": sess["file"], "content": text})
+        r = gh.handle("push_file", {"repo": sess["repo"], "path": sess["file"], "content": text})
         sessions.pop(uid, None)
         await update.message.reply_text(f"Pushed: {r.get('pushed', r.get('error'))}")
         return
@@ -1032,7 +1161,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if mode == "push_approval":
         if text.lower() in ("yes","y"):
             repo = sess["answers"].get("repo") or sess["answers"].get("project","")
-            r    = github_agent.handle("push_file", {"repo": repo, "path": sess["file"], "content": sess["content"]})
+            r    = gh.handle("push_file", {"repo": repo, "path": sess["file"], "content": sess["content"]})
             await update.message.reply_text(f"Pushed: {r.get('pushed', r.get('error'))}")
         else:
             await update.message.reply_text("Cancelled.")
@@ -1063,7 +1192,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if match:
             repo = match.group(1)
             file = sess.get("last_file", "output.txt")
-            github_agent.handle("push_file", {"repo": repo, "path": file, "content": sess["last_code"]})
+            gh.handle("push_file", {"repo": repo, "path": file, "content": sess["last_code"]})
             sessions.pop(uid, None)
             await update.message.reply_text(f"Pushed to {repo}/{file}")
         return
@@ -1072,7 +1201,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if text.strip().upper() == "YES":
             sessions.pop(uid, None)
             await update.message.reply_text("💣 Nuking S3 bucket...")
-            r = aws_agent.nuke_s3_bucket()
+            r = aw.nuke_s3_bucket()
             if "error" in r:
                 await update.message.reply_text(f"❌ {r['error']}")
             else:
@@ -1144,26 +1273,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Update flow: repo → file browser → content → push + trigger ────────────────
     if mode == "update_repo":
         repo = text.strip()
+        branches_result = gh.list_branches(repo)
+        available_branches = branches_result.get("branches", [])
+
+        if branches_result.get("status") == "error" or not available_branches:
+            await _repo_not_found(update, uid, repo, gh, "update_repo", "Please enter the correct repo name:")
+            return
+
         sessions[uid] = {"mode": "update_branch", "answers": {"repo": repo}}
-        
-        try:
-            branches_result = github_agent.list_branches(repo)
-            available_branches = branches_result.get("branches", [])
-            
-            if available_branches:
-                keyboard = []
-                # Layout branches in a 2-column grid
-                for i in range(0, len(available_branches), 2):
-                    row = [InlineKeyboardButton(b, callback_data=f"upd_br|{b}") for b in available_branches[i:i+2]]
-                    keyboard.append(row)
-                    
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text("Which branch?", reply_markup=reply_markup)
-            else:
-                await update.message.reply_text(f"⚠️ Could not find any branches for `{repo}`.\nPlease enter a valid branch name manually:", parse_mode="Markdown")
-        except Exception as e:
-            logger.warning(f"Failed to fetch branches for {repo} in UI prompt: {e}")
-            await update.message.reply_text("Which branch? (e.g. main, dev)")
+        keyboard = []
+        for i in range(0, len(available_branches), 2):
+            row = [InlineKeyboardButton(b, callback_data=f"upd_br|{b}") for b in available_branches[i:i+2]]
+            keyboard.append(row)
+        await update.message.reply_text("Which branch?", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if mode == "update_branch":
@@ -1172,7 +1294,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         # Validate that the branch actually exists in the repo
         try:
-            branches_result = github_agent.list_branches(repo)
+            branches_result = gh.list_branches(repo)
             available_branches = branches_result.get("branches", [])
             
             if branch not in available_branches:
@@ -1403,7 +1525,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
             if env_vars:
                 await update.message.reply_text("🔐 Uploading secrets to GitHub repository...")
-                res = github_agent.handle("set_secrets", {"repo": repo, "secrets": env_vars})
+                res = gh.handle("set_secrets", {"repo": repo, "secrets": env_vars})
                 if res.get("status") == "ok":
                     await update.message.reply_text(f"✅ {len(env_vars)} secret(s) securely saved to GitHub!")
                 else:
@@ -1469,18 +1591,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         repo = text.strip()
         sessions.pop(uid, None)
         await update.message.reply_text(f"Triggering deploy.yml in {repo}...")
-        r = github_agent.handle("trigger", {"repo": repo, "workflow": "deploy.yml"})
+        r = gh.handle("trigger", {"repo": repo, "workflow": "deploy.yml"})
         await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
         return
 
     # ── Destroy flow ──────────────────────────────────────────────────────────
     if mode == "destroy_project":
         project = text.strip()
-        # Show available branches so user can pick the right one
-        dep  = state.get_deployment(project) or {}
+        dep = state.get_deployment(project)
+        if not dep:
+            sessions[uid] = {"mode": "destroy_project", "answers": {}}
+            await _project_not_found(update, uid, project, "destroy_project", {})
+            return
+        dep  = dep or {}
         repo = dep.get("repo", project)
         try:
-            branches_result = github_agent.list_branches(repo)
+            branches_result = gh.list_branches(repo)
             branches = [b for b in branches_result.get("branches", []) if b != "main"]
         except Exception:
             branches = []
@@ -1576,7 +1702,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         branch = intent.get("branch", "main")
         if repo:
             await update.message.reply_text(f"Triggering pipeline in {repo} on branch {branch}...")
-            r = github_agent.trigger_pipeline(repo, "deploy.yml", branch)
+            r = gh.trigger_pipeline(repo, "deploy.yml", branch)
             await update.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
         else:
             sessions[uid] = {"mode": "trigger_repo", "answers": {}}
@@ -1634,7 +1760,234 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Credential Validation ─────────────────────────────────────────────────────
+
+# Required IAM actions for this bot (grouped by service)
+_REQUIRED_IAM = {
+    "EC2": [
+        ("ec2:DescribeInstances",         "List/check running EC2 instances"),
+        ("ec2:RunInstances",              "Launch new EC2 instances"),
+        ("ec2:TerminateInstances",        "Terminate EC2 instances on destroy"),
+        ("ec2:CreateKeyPair",             "Create SSH key pairs"),
+        ("ec2:DeleteKeyPair",             "Delete SSH key pairs on cleanup"),
+        ("ec2:DescribeKeyPairs",          "Check existing SSH key pairs"),
+        ("ec2:CreateSecurityGroup",       "Create security groups"),
+        ("ec2:DeleteSecurityGroup",       "Delete security groups on cleanup"),
+        ("ec2:DescribeSecurityGroups",    "Check existing security groups"),
+        ("ec2:AuthorizeSecurityGroupIngress", "Open ports on security groups"),
+        ("ec2:DescribeVpcs",              "List VPCs for instance launch"),
+        ("ec2:DescribeSubnets",           "List subnets for instance launch"),
+        ("ec2:DescribeImages",            "Look up AMI images"),
+    ],
+    "S3": [
+        ("s3:CreateBucket",               "Create Terraform state bucket"),
+        ("s3:DeleteBucket",               "Delete bucket on full cleanup"),
+        ("s3:PutObject",                  "Upload Terraform state files"),
+        ("s3:GetObject",                  "Download Terraform state files"),
+        ("s3:DeleteObject",               "Remove state files on destroy"),
+        ("s3:ListBucket",                 "List objects in state bucket"),
+        ("s3:PutBucketVersioning",        "Enable versioning on state bucket"),
+    ],
+    "SSM": [
+        ("ssm:PutParameter",              "Store SSH keys / config in Parameter Store"),
+        ("ssm:GetParameter",              "Retrieve stored SSH keys / config"),
+        ("ssm:DeleteParameter",           "Remove parameters on cleanup"),
+        ("ssm:DescribeParameters",        "List stored parameters"),
+    ],
+    "STS": [
+        ("sts:GetCallerIdentity",         "Verify AWS credentials are valid"),
+    ],
+}
+
+_PERMISSION_GUIDE = """\
+📖 *How to add the missing permissions:*
+
+1. Open the *AWS Console* → *IAM* → *Users*
+2. Click your user name → *Permissions* tab → *Add permissions*
+3. Choose *Attach policies directly*
+4. For full access you can attach these managed policies:
+   • `AmazonEC2FullAccess`
+   • `AmazonS3FullAccess`
+   • `AmazonSSMFullAccess`
+   • `IAMReadOnlyAccess`
+5. Click *Next* → *Add permissions*
+
+Or for a minimal custom policy, create an *inline policy* with only \
+the actions listed above under each service.
+
+After adding permissions, run /setup again to re-validate."""
+
+async def _validate_credentials(update, uid: int, creds: dict):
+    """Validate AWS + GitHub credentials after setup and report any issues."""
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+    from github import GithubException
+
+    lines = []
+    has_error = False
+
+    # ── AWS ──────────────────────────────────────────────────────────────────
+    aws_key    = creds.get("aws_access_key_id", "").strip()
+    aws_secret = creds.get("aws_secret_key", "").strip()
+    aws_region = creds.get("aws_region", "us-east-1").strip()
+
+    aws_ok = False
+    account_id = "unknown"
+    try:
+        sts = boto3.client(
+            "sts",
+            region_name=aws_region,
+            aws_access_key_id=aws_key,
+            aws_secret_access_key=aws_secret,
+        )
+        identity = sts.get_caller_identity()
+        account_id = identity.get("Account", "unknown")
+        aws_ok = True
+        lines.append(f"✅ *AWS credentials valid* — Account `{account_id}`, Region `{aws_region}`")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in ("InvalidClientTokenId", "SignatureDoesNotMatch", "AuthFailure"):
+            lines.append("❌ *AWS credentials are invalid.* Please check your Access Key ID and Secret Access Key.")
+        else:
+            lines.append(f"❌ *AWS error:* `{code}` — {e.response['Error']['Message']}")
+        has_error = True
+    except NoCredentialsError:
+        lines.append("❌ *AWS credentials missing.* Please run /setup again.")
+        has_error = True
+    except Exception as e:
+        lines.append(f"❌ *AWS connection error:* {e}")
+        has_error = True
+
+    # ── AWS permission checks (only if credentials are valid) ─────────────────
+    missing_perms = []
+    if aws_ok:
+        try:
+            iam = boto3.client(
+                "iam",
+                region_name=aws_region,
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret,
+            )
+            all_actions = [a for actions in _REQUIRED_IAM.values() for a, _ in actions]
+            sim = iam.simulate_principal_policy(
+                PolicySourceArn=identity["Arn"],
+                ActionNames=all_actions,
+            )
+            denied = [
+                r["EvalActionName"]
+                for r in sim.get("EvaluationResults", [])
+                if r["EvalDecision"] != "allowed"
+            ]
+            if denied:
+                # Map back to service + description
+                action_map = {a: (svc, desc) for svc, actions in _REQUIRED_IAM.items() for a, desc in actions}
+                by_service = {}
+                for a in denied:
+                    svc, desc = action_map.get(a, ("Other", a))
+                    by_service.setdefault(svc, []).append(f"`{a}` — {desc}")
+                missing_perms = by_service
+                perm_lines = []
+                for svc, items in by_service.items():
+                    perm_lines.append(f"\n*{svc}:*")
+                    perm_lines.extend(f"  • {i}" for i in items)
+                lines.append("⚠️ *Missing IAM permissions:*" + "\n".join(perm_lines))
+                has_error = True
+            else:
+                lines.append("✅ *AWS IAM permissions* — all required permissions present")
+        except ClientError as e:
+            # simulate_principal_policy itself may be denied — warn but continue
+            if e.response["Error"]["Code"] == "AccessDenied":
+                lines.append("⚠️ *Could not verify IAM permissions* (no `iam:SimulatePrincipalPolicy` access).\n"
+                             "Make sure your user has EC2, S3, SSM, and STS permissions.")
+            else:
+                lines.append(f"⚠️ *IAM check error:* {e}")
+        except Exception as e:
+            lines.append(f"⚠️ *IAM check skipped:* {e}")
+
+    # ── GitHub ────────────────────────────────────────────────────────────────
+    gh_token    = creds.get("github_token", "").strip()
+    gh_username = creds.get("github_username", "").strip()
+    try:
+        from github import Github
+        g = Github(gh_token)
+        gh_user = g.get_user()
+        login = gh_user.login
+        if login.lower() != gh_username.lower():
+            lines.append(
+                f"⚠️ *GitHub token belongs to `{login}`*, but you entered username `{gh_username}`.\n"
+                f"This may cause issues — please verify."
+            )
+            has_error = True
+        else:
+            lines.append(f"✅ *GitHub token valid* — logged in as `{login}`")
+
+        # Check repo scope (try listing repos)
+        repos = list(gh_user.get_repos(type="owner"))
+        lines.append(f"✅ *GitHub repo access* — {len(repos)} repo(s) accessible")
+
+    except GithubException as e:
+        if e.status == 401:
+            lines.append("❌ *GitHub token is invalid or expired.* Please generate a new token at https://github.com/settings/tokens")
+        elif e.status == 403:
+            lines.append("❌ *GitHub token lacks required scopes.* Ensure your token has: `repo`, `workflow`, `admin:repo_hook`")
+        else:
+            lines.append(f"❌ *GitHub error:* {e.data.get('message', str(e))}")
+        has_error = True
+    except Exception as e:
+        lines.append(f"❌ *GitHub connection error:* {e}")
+        has_error = True
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    summary = "\n".join(lines)
+    if has_error:
+        suffix = "\n\n" + _PERMISSION_GUIDE if missing_perms else "\n\nRun /setup to correct your credentials."
+        await update.message.reply_text(
+            f"🔍 *Credential Validation Report*\n\n{summary}{suffix}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"🔍 *Credential Validation Report*\n\n{summary}\n\n"
+            "✅ Everything looks good! You can now use /deploy, /destroy, and all other commands.",
+            parse_mode="Markdown",
+        )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _repo_not_found(update, uid, repo: str, gh, retry_mode: str, retry_prompt: str = "Please enter the correct repo name:"):
+    """Reply with a 'repo not found' message + inline buttons to retry or list all repos."""
+    r = gh.handle("list_repos", {})
+    repos = [x["name"] for x in r.get("repos", [])[:20]]
+    keyboard = [[InlineKeyboardButton("📋 Show my repos", callback_data="show_repos")]]
+    sessions[uid]["mode"] = retry_mode
+    await update.message.reply_text(
+        f"❌ Repository `{repo}` not found.\n\n"
+        f"{retry_prompt}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    if repos:
+        await update.message.reply_text(
+            "Your repos:\n" + "\n".join(f"  • {n}" for n in repos)
+        )
+
+
+async def _project_not_found(update, uid, project: str, retry_mode: str, retry_answers: dict, retry_prompt: str = "Please enter the correct project name:"):
+    """Reply with a 'project not found' message + inline button to list all projects."""
+    projects = state.list_projects()
+    keyboard = [[InlineKeyboardButton("📋 Show my projects", callback_data="show_projects")]]
+    sessions[uid] = {"mode": retry_mode, "answers": retry_answers}
+    await update.message.reply_text(
+        f"❌ Project `{project}` not found.\n\n"
+        f"{retry_prompt}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    if projects:
+        lines = [f"  • {p['project']} ({p['status']})" for p in projects]
+        await update.message.reply_text("Your projects:\n" + "\n".join(lines))
+
 
 async def _show_confirm(update, uid, answers):
     sessions[uid] = {"mode": "confirm_deploy", "answers": answers}
@@ -1667,6 +2020,12 @@ async def _send_long(update, text):
         await update.message.reply_text(text[i:i+4000])
 
 async def _run_deploy(update, uid, answers):
+    if not state.user_creds_complete(uid):
+        await update.message.reply_text(
+            "⚠️ No credentials configured. Please run /setup first to provide your AWS & GitHub credentials."
+        )
+        return
+    creds = state.get_user_creds(uid)
     sessions[uid] = {"mode": "running", "project": answers.get("project"), "answers": answers}
     set_running(uid, True)
 
@@ -1683,6 +2042,7 @@ async def _run_deploy(update, uid, answers):
             region      = answers.get("region", "us-east-1"),
             branch      = answers.get("branch", "main"),
             target      = answers.get("target", "ec2"),
+            creds       = creds,
             progress_cb = cb,
         )
         if result["status"] == "success":
@@ -1712,7 +2072,7 @@ async def _run_deploy(update, uid, answers):
                 f"🎯 Target  : {target_label}\n"
                 f"🌿 Branch  : {branch}\n"
                 f"🌍 Region  : {region}\n"
-                f"🔗 Repo    : github.com/{github_agent.username}/{repo}\n"
+                f"🔗 Repo    : github.com/{(GitHubAgent.with_creds(creds) if creds else github_agent).username}/{repo}\n"
                 + (f"🌐 Live at : {url}\n" if url else "🌐 Live at : (check pipeline logs)\n")
             )
             await update.message.reply_text(banner)
@@ -1724,7 +2084,8 @@ async def _run_deploy(update, uid, answers):
                     target_label=target_label, branch=branch,
                     region=region, url=url, repo=repo,
                 )
-                push_result = github_agent.push_single_file(
+                _gh_scoped = GitHubAgent.with_creds(creds) if creds else github_agent
+                push_result = _gh_scoped.push_single_file(
                     repo, "README.md", readme,
                     f"docs: update README for {branch} deployment [{app} on {target}] [skip ci]",
                     branch=branch,
@@ -1785,6 +2146,7 @@ async def _run_deploy(update, uid, answers):
 
 
 async def _apply_fix(update, uid, sess):
+    creds = state.get_user_creds(uid)
     set_running(uid, True)
     fix = sess["fix"]; answers = sess["answers"]
 
@@ -1797,7 +2159,7 @@ async def _apply_fix(update, uid, sess):
             user_id=uid, project=answers["project"],
             repo_name=answers.get("repo_name") or answers.get("repo"),
             file_path=fix["file"], fixed_content=fix["fixed_content"],
-            retry=fix.get("retry", 1), progress_cb=cb,
+            retry=fix.get("retry", 1), creds=creds, progress_cb=cb,
         )
         await update.message.reply_text(
             f"Fixed! URL: {result.get('url')}" if result["status"] == "success"
@@ -1824,7 +2186,7 @@ async def _run_push_and_ask_deploy(update, uid, answers):
 
     try:
         branch = answers.get("branch", "main")
-        push = github_agent.push_single_file(repo, file_path, content, f"Update: {file_path}", branch=branch)
+        push = _agents(uid)[0].push_single_file(repo, file_path, content, f"Update: {file_path}", branch=branch)
 
         if push.get("failed"):
             await update.message.reply_text(f"❌ Push failed: {push['failed']}")
@@ -1854,6 +2216,12 @@ async def _run_push_and_ask_deploy(update, uid, answers):
 
 
 async def _run_destroy(update, uid, answers):
+    if not state.user_creds_complete(uid):
+        await update.message.reply_text(
+            "⚠️ No credentials configured. Please run /setup first to provide your AWS & GitHub credentials."
+        )
+        return
+    creds = state.get_user_creds(uid)
     set_running(uid, True)
 
     async def cb(msg):
@@ -1868,6 +2236,7 @@ async def _run_destroy(update, uid, answers):
             branch=answers.get("branch", "main"),
             delete_repo=answers.get("del_repo","no").lower()=="yes", 
             delete_branch=answers.get("del_branch","no").lower()=="yes",
+            creds=creds,
             progress_cb=cb,
         )
         project = answers["project"]
@@ -1918,7 +2287,7 @@ async def _run_initnode_generation(update: Update, uid: int, answers: dict):
     try:
         # Step 1: Create GitHub Repo
         await cb(f"⏳ 1/3 Creating GitHub repository `{repo}`...")
-        r_repo = github_agent.handle("create_repo", {"name": repo})
+        r_repo = _agents(uid)[0].handle("create_repo", {"name": repo})
         if r_repo.get("status") != "created" and r_repo.get("status") != "exists":
             await cb(f"❌ Failed to create repo: {r_repo.get('error')}")
             return
@@ -1948,7 +2317,7 @@ async def _run_initnode_generation(update: Update, uid: int, answers: dict):
 
         failed_pushes = []
         for file_path, file_content in files_to_push.items():
-            push_res = github_agent.push_single_file(
+            push_res = _agents(uid)[0].push_single_file(
                 repo, file_path, file_content, f"Init generated {file_path}", branch="main"
             )
             if push_res.get("failed"):
@@ -2021,7 +2390,7 @@ async def _check_node_repo(update: Update, uid: int, answers: dict, missing: lis
         await cb(f"🔍 Analyzing repository `{repo}`...")
         
         # We need to see if it even exists
-        res_files = github_agent.get_existing_files(repo)
+        res_files = _agents(uid)[0].get_existing_files(repo)
         
         if res_files.get("status") == "error":
             # Assume repo doesn't exist or is empty
@@ -2168,7 +2537,7 @@ async def _check_node_repo(update: Update, uid: int, answers: dict, missing: lis
 
 async def _show_repo_browser(update: Update, uid: int, repo: str, path: str = "", branch: str = "main"):
     """Show interactive GitHub file browser using InlineKeyboardMarkup"""
-    res = github_agent.list_dir_contents(repo, path, branch=branch)
+    res = _agents(uid)[0].list_dir_contents(repo, path, branch=branch)
     if res.get("status") == "error":
         msg = f"❌ Error browsing {repo}/{path} on branch {branch}: {res.get('error')}"
         if update.callback_query:
@@ -2230,7 +2599,7 @@ async def _poll_update_and_notify(update: Update, uid: int, repo: str, branch: s
         # We need to wait a few seconds so the pipeline actually registers in GitHub before we start polling
         await asyncio.sleep(5)
         
-        res = await github_agent.poll_pipeline(repo, interval=15, max_wait=900, branch=branch)
+        res = await _agents(uid)[0].poll_pipeline(repo, interval=15, max_wait=900, branch=branch)
         
         if res.get("status") == "completed" and res.get("conclusion") == "success":
             # Attempt to get live URL from branch-scoped state
@@ -2248,7 +2617,7 @@ async def _poll_update_and_notify(update: Update, uid: int, repo: str, branch: s
             
             url = f"http://{ip.replace('http://', '').replace('https://', '')}" if ip else None
             live_link = f"🌐 Live at: {url}\n" if url else "🌐 Live at: (check pipeline logs)\n"
-            repo_link = f"🔗 Repo: github.com/{github_agent.username}/{repo}"
+            repo_link = f"🔗 Repo: github.com/{_agents(uid)[0].username}/{repo}"
             
             project_name = branch_project
             banner = (
@@ -2258,7 +2627,7 @@ async def _poll_update_and_notify(update: Update, uid: int, repo: str, branch: s
                 "🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉\n"
                 "\n"
                 f"📦 Project : {project_name}\n"
-                f"🔗 Repo    : github.com/{github_agent.username}/{repo}\n"
+                f"🔗 Repo    : github.com/{_agents(uid)[0].username}/{repo}\n"
                 f"{live_link}"
             )
             await cb(banner)
@@ -2312,7 +2681,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         repo = parts[1]
         branch = parts[2] if len(parts) > 2 else "main"
         await query.message.reply_text(f"🚀 Triggering deploy for {repo} on branch {branch}...")
-        r = github_agent.trigger_pipeline(repo, "deploy.yml", branch)
+        r = _agents(uid)[0].trigger_pipeline(repo, "deploy.yml", branch)
         await query.message.reply_text(f"{r.get('status')} — {r.get('url', r.get('error',''))}")
         sessions.pop(uid, None)
         
@@ -2343,7 +2712,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         repo = sess["repo"]
         await query.message.reply_text(
             f"🛑 Deployment paused.\n"
-            f"Please fix the repository manually in GitHub: `github.com/{github_agent.username}/{repo}`\n"
+            f"Please fix the repository manually in GitHub: `github.com/{_agents(uid)[0].username}/{repo}`\n"
             f"Run `/deploy` again when you are ready.",
             parse_mode="Markdown"
         )
@@ -2380,6 +2749,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Process through main handler
         await handle_message(fake_update, context)
 
+    elif data.startswith("delcreds|"):
+        action = data.split("|", 1)[1]
+        if action == "confirm":
+            state.delete_user_creds(uid)
+            sessions.pop(uid, None)
+            await query.message.edit_text(
+                "✅ Your credentials have been deleted.\n\n"
+                "Run /setup to add new credentials when needed."
+            )
+        else:
+            await query.message.edit_text("❌ Cancelled — your credentials are still saved.")
+
+    elif data == "show_repos":
+        gh, aw = _agents(uid)
+        r = gh.handle("list_repos", {})
+        repos = r.get("repos", [])
+        if repos:
+            lines = [f"• {x['name']}" for x in repos[:20]]
+            await query.message.reply_text("Your GitHub repositories:\n" + "\n".join(lines))
+        else:
+            await query.message.reply_text("No repositories found.")
+
+    elif data == "show_projects":
+        projects = state.list_projects()
+        if projects:
+            lines = [f"• {p['project']} ({p['status']})" for p in projects]
+            await query.message.reply_text("Known projects:\n" + "\n".join(lines))
+        else:
+            await query.message.reply_text("No projects found.")
+
     elif data.startswith("nodefix_ai|"):
         sess = sessions.get(uid)
         if not sess or sess.get("mode") != "node_fix_decision": return
@@ -2393,7 +2792,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 failed = []
                 for file_path, content in fix_files.items():
-                    res = github_agent.push_single_file(repo, file_path, content, f"AI Auto-fix for {file_path}", branch="main")
+                    res = _agents(uid)[0].push_single_file(repo, file_path, content, f"AI Auto-fix for {file_path}", branch="main")
                     if res.get("failed"): failed.append(file_path)
                 
                 if failed:
@@ -2452,6 +2851,9 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("setup",        cmd_setup))
+    app.add_handler(CommandHandler("mysetup",      cmd_mysetup))
+    app.add_handler(CommandHandler("deletecreds",  cmd_deletecreds))
     app.add_handler(CommandHandler("stop",     cmd_stop))
     app.add_handler(CommandHandler("reset",    cmd_reset))
     app.add_handler(CommandHandler("deploy",   cmd_deploy))

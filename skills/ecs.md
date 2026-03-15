@@ -166,6 +166,9 @@ output "alb_url" {
 on:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   terraform:
     runs-on: ubuntu-latest
