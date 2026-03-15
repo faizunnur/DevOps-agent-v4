@@ -397,11 +397,11 @@ class AWSAgent:
     # ── Credentials ───────────────────────────────────────────────────────────
 
     def get_credentials(self) -> dict:
-        """Return current AWS credentials from environment."""
+        """Return current AWS credentials (per-user scoped, not os.getenv)."""
         return {
-            "AWS_ACCESS_KEY_ID":     os.getenv("AWS_ACCESS_KEY_ID", ""),
-            "AWS_SECRET_ACCESS_KEY": os.getenv("AWS_SECRET_ACCESS_KEY", ""),
-            "AWS_REGION":            self.region,
+            "AWS_ACCESS_KEY_ID":     self.access_key  or os.getenv("AWS_ACCESS_KEY_ID", ""),
+            "AWS_SECRET_ACCESS_KEY": self.secret_key  or os.getenv("AWS_SECRET_ACCESS_KEY", ""),
+            "AWS_REGION":            self.region       or os.getenv("AWS_DEFAULT_REGION", "us-east-1"),
         }
 
     def check_all_resources(self, project: str) -> dict:
@@ -523,11 +523,83 @@ class AWSAgent:
         return results
 
 
+    # ── S3 bucket management ──────────────────────────────────────────────────
+
+    def list_all_buckets(self) -> dict:
+        """Return all S3 buckets owned by this account."""
+        try:
+            resp = self._s3().list_buckets()
+            buckets = [
+                {"name": b["Name"], "created": str(b["CreationDate"])}
+                for b in resp.get("Buckets", [])
+            ]
+            return {"status": "ok", "buckets": buckets}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def list_bucket_objects(self, bucket: str) -> dict:
+        """List all objects inside a bucket (paginated, max 1000 shown)."""
+        try:
+            s3 = self._s3()
+            objects = []
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket):
+                for obj in page.get("Contents", []):
+                    objects.append({
+                        "key":  obj["Key"],
+                        "size": obj["Size"],
+                        "last_modified": str(obj["LastModified"]),
+                    })
+                if len(objects) >= 1000:
+                    break
+            return {"status": "ok", "bucket": bucket, "objects": objects, "count": len(objects)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def delete_bucket_object(self, bucket: str, key: str) -> dict:
+        """Delete a single object from a bucket."""
+        try:
+            self._s3().delete_object(Bucket=bucket, Key=key)
+            return {"status": "ok", "deleted": key, "bucket": bucket}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def delete_entire_bucket(self, bucket: str) -> dict:
+        """Delete all objects (including versions) then delete the bucket itself."""
+        s3 = self._s3()
+        deleted_count = 0
+        try:
+            # Delete all current objects
+            paginator = s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=bucket):
+                objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+                if objs:
+                    s3.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+                    deleted_count += len(objs)
+            # Delete all versioned objects / delete markers
+            try:
+                ver_paginator = s3.get_paginator("list_object_versions")
+                for page in ver_paginator.paginate(Bucket=bucket):
+                    versions = [
+                        {"Key": v["Key"], "VersionId": v["VersionId"]}
+                        for v in page.get("Versions", []) + page.get("DeleteMarkers", [])
+                    ]
+                    if versions:
+                        s3.delete_objects(Bucket=bucket, Delete={"Objects": versions})
+                        deleted_count += len(versions)
+            except Exception:
+                pass
+            s3.delete_bucket(Bucket=bucket)
+            return {"status": "ok", "bucket": bucket, "objects_deleted": deleted_count}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def handle(self, action: str, args: dict) -> dict:
         """
         Flexible standalone handler.
         Actions: prepare, check_ec2, gen_ssh_key, get_ssh_keys,
-                 ensure_s3, list_ec2, cleanup, credentials
+                 ensure_s3, list_ec2, cleanup, credentials,
+                 list_buckets, list_bucket_objects, delete_bucket_object, delete_entire_bucket
         """
         try:
             if action == "prepare":
@@ -574,6 +646,18 @@ class AWSAgent:
 
             elif action == "terminate_ec2":
                 return self.terminate_ec2(args["project"])
+
+            elif action == "list_buckets":
+                return self.list_all_buckets()
+
+            elif action == "list_bucket_objects":
+                return self.list_bucket_objects(args["bucket"])
+
+            elif action == "delete_bucket_object":
+                return self.delete_bucket_object(args["bucket"], args["key"])
+
+            elif action == "delete_entire_bucket":
+                return self.delete_entire_bucket(args["bucket"])
 
             else:
                 return {"status": "error", "error": f"Unknown action: {action}"}

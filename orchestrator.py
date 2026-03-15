@@ -73,17 +73,26 @@ def _patch_terraform_bucket(files: dict, correct_bucket: str, correct_region: st
         return block
 
     for path, file_content in list(files.items()):
-        if not path.endswith(".tf"):
-            continue
-        patched = _re.sub(
-            r'backend\s+"s3"\s*\{[^}]+\}',
-            clean_backend,
-            file_content,
-            flags=_re.DOTALL,
-        )
-        if patched != file_content:
-            files[path] = patched
-            logger.info(f"_patch_terraform_bucket: cleaned backend block in {path}")
+        if path.endswith(".tf"):
+            patched = _re.sub(
+                r'backend\s+"s3"\s*\{[^}]+\}',
+                clean_backend,
+                file_content,
+                flags=_re.DOTALL,
+            )
+            if patched != file_content:
+                files[path] = patched
+                logger.info(f"_patch_terraform_bucket: cleaned backend block in {path}")
+        elif path.endswith(".yml") or path.endswith(".yaml"):
+            # Inject -reconfigure into terraform init lines in workflow files
+            patched = _re.sub(
+                r'(\bterraform init)(\s+(?!-reconfigure))',
+                lambda m: m.group(1) + " -reconfigure" + m.group(2),
+                file_content,
+            )
+            if patched != file_content:
+                files[path] = patched
+                logger.info(f"_patch_terraform_bucket: injected -reconfigure in {path}")
 
 
 
@@ -262,7 +271,42 @@ class Orchestrator:
             dep = state.get_deployment(branch_project)
             if dep and dep.get("status") == "deployed" and dep.get("ec2_ip"):
                 await cb(f"Project '{branch_project}' was previously deployed successfully.")
-                await cb(f"Skipping file generation — retriggering pipeline only...")
+                await cb(f"Updating secrets and workflow backend before re-triggering...")
+
+                # Always refresh secrets so the pipeline uses THIS user's credentials/bucket
+                bucket_name  = _aws.get_state_bucket_name()
+                _aws.ensure_s3_bucket(bucket_name)
+                aws_creds_rerun = _aws.get_credentials()
+                ssh_keys_rerun  = _aws.get_ssh_keys(branch_project)
+                if not ssh_keys_rerun.get("private_key"):
+                    ssh_keys_rerun = _aws.generate_ssh_key(branch_project)
+
+                rerun_secrets = {
+                    "AWS_ACCESS_KEY_ID":     aws_creds_rerun["AWS_ACCESS_KEY_ID"],
+                    "AWS_SECRET_ACCESS_KEY": aws_creds_rerun["AWS_SECRET_ACCESS_KEY"],
+                    "AWS_REGION":            region,
+                    "SSH_PRIVATE_KEY":       ssh_keys_rerun.get("private_key", ""),
+                    "SSH_PUBLIC_KEY":        ssh_keys_rerun.get("public_key", ""),
+                    "PROJECT_NAME":          branch_project,
+                    "TF_STATE_BUCKET":       bucket_name,
+                    "SSH_USER":              os.getenv("SSH_USER", "ubuntu"),
+                }
+                _github.set_secrets(repo_name, rerun_secrets)
+                await cb(f"✓ Secrets updated — bucket: {bucket_name}")
+
+                # Patch workflow files to ensure -reconfigure is present
+                branch_files_rerun = _github.get_existing_files(repo_name, branch=branch)
+                branch_files_before_rerun = dict(branch_files_rerun)
+                _patch_terraform_bucket(branch_files_rerun, bucket_name, region)
+                rerun_patches = {
+                    p: c for p, c in branch_files_rerun.items()
+                    if c != branch_files_before_rerun.get(p)
+                }
+                if rerun_patches:
+                    pr = _github.push_files(repo_name, rerun_patches,
+                                            message="fix: update terraform backend for rerun",
+                                            branch=branch)
+                    await cb(f"✓ Patched workflow files: {pr.get('pushed', [])}")
 
                 cancelled = _github.cancel_running_pipelines(repo_name)
                 if cancelled.get("cancelled"):
@@ -293,9 +337,9 @@ class Orchestrator:
             if "error" in aws_result.get("ssh", {}):
                 raise Exception(f"SSH key generation failed: {aws_result['ssh']['error']}")
 
-            ssh_keys = aws_result["ssh"]
-            creds    = aws_result["credentials"]
-            ec2      = aws_result["ec2"]
+            ssh_keys  = aws_result["ssh"]
+            aws_creds = aws_result["credentials"]
+            ec2       = aws_result["ec2"]
             existing = aws_result.get("existing", {})
 
             # Report all existing resources
@@ -416,14 +460,28 @@ class Orchestrator:
             elif bucket_result.get("error"):
                 await cb(f"⚠️ S3 bucket error: {bucket_result['error']}")
 
-            # Patch any terraform files in the branch that have a wrong/old bucket name
-            # This handles the case where the branch was generated with a different account's bucket
+            # Patch any terraform/workflow files in the branch that have a wrong bucket name
+            # or are missing -reconfigure. Collect diffs and push them back.
+            repo_files_before = dict(repo_files)  # snapshot before patching
             _patch_terraform_bucket(repo_files, bucket_name, region)
+            backend_patches = {
+                p: c for p, c in repo_files.items()
+                if c != repo_files_before.get(p)
+            }
+            if backend_patches:
+                await cb(f"Patching backend config in {list(backend_patches.keys())}...")
+                patch_result = _github.push_files(repo_name, backend_patches,
+                                                  message="fix: update terraform backend bucket and reconfigure flag",
+                                                  branch=branch)
+                if patch_result.get("failed"):
+                    await cb(f"⚠️ Backend patch push failed: {patch_result['failed']}")
+                else:
+                    await cb(f"✓ Backend patched: {patch_result.get('pushed', [])}")
 
             # Set secrets — PROJECT_NAME uses branch_project so each branch has isolated AWS resources
             secrets = {
-                "AWS_ACCESS_KEY_ID":     creds["AWS_ACCESS_KEY_ID"],
-                "AWS_SECRET_ACCESS_KEY": creds["AWS_SECRET_ACCESS_KEY"],
+                "AWS_ACCESS_KEY_ID":     aws_creds["AWS_ACCESS_KEY_ID"],
+                "AWS_SECRET_ACCESS_KEY": aws_creds["AWS_SECRET_ACCESS_KEY"],
                 "AWS_REGION":            region,
                 "SSH_PRIVATE_KEY":       ssh_keys["private_key"],
                 "SSH_PUBLIC_KEY":        ssh_keys["public_key"],
@@ -802,16 +860,21 @@ class Orchestrator:
             # Ensure S3 bucket exists in this account
             _aws.ensure_s3_bucket(bucket_name)
 
-            # Patch terraform backend on the deploy branch before triggering destroy
+            # Patch terraform backend + workflow files on the deploy branch before triggering destroy
             branch_files = _github.get_existing_files(repo_name, branch=deploy_branch)
+            branch_files_before = dict(branch_files)
             _patch_terraform_bucket(branch_files, bucket_name, region)
-            for path, fc in branch_files.items():
-                if path.endswith(".tf"):
-                    _github.push_single_file(
-                        repo_name, path, fc,
-                        f"fix: update terraform backend for destroy",
-                        branch=deploy_branch,
-                    )
+            destroy_patches = {
+                p: c for p, c in branch_files.items()
+                if c != branch_files_before.get(p)
+            }
+            if destroy_patches:
+                push_r = _github.push_files(
+                    repo_name, destroy_patches,
+                    message="fix: update terraform backend for destroy",
+                    branch=deploy_branch,
+                )
+                for path in push_r.get("pushed", []):
                     await cb(f"Patched {path} → bucket: {bucket_name}")
 
             # Cancel any running pipelines first

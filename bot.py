@@ -713,6 +713,101 @@ async def cmd_aws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Key: {creds_info.get('AWS_ACCESS_KEY_ID','')[:8]}...\nRegion: {creds_info.get('AWS_REGION')}")
 
 
+async def cmd_s3(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /s3          — list all your S3 buckets with inline actions
+    /s3 <bucket> — list objects inside a specific bucket
+    """
+    uid = update.effective_user.id
+    _gh, aw = _agents(uid)
+    args = ctx.args
+
+    if args:
+        # Show objects in the named bucket directly
+        bucket = args[0]
+        await _s3_show_objects(update.message, aw, bucket)
+    else:
+        # List all buckets
+        await _s3_show_buckets(update.message, aw)
+
+
+async def _s3_show_buckets(message, aw):
+    """Send bucket list with View / Delete buttons for each."""
+    r = aw.list_all_buckets()
+    if r.get("status") == "error":
+        await message.reply_text(f"❌ {r['error']}")
+        return
+    buckets = r.get("buckets", [])
+    if not buckets:
+        await message.reply_text("🪣 No S3 buckets found in your account.")
+        return
+    keyboard = []
+    for b in buckets:
+        name = b["name"]
+        keyboard.append([
+            InlineKeyboardButton(f"🪣 {name}", callback_data=f"s3_view|{name[:60]}"),
+            InlineKeyboardButton("🗑 Delete", callback_data=f"s3_del_bucket|{name[:60]}"),
+        ])
+    await message.reply_text(
+        f"🪣 *Your S3 Buckets* ({len(buckets)} total)\n\nTap a bucket to browse its objects:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def _s3_show_objects(message, aw, bucket: str, page: int = 0):
+    """Send paginated object list with Delete buttons."""
+    r = aw.list_bucket_objects(bucket)
+    if r.get("status") == "error":
+        await message.reply_text(f"❌ {r['error']}")
+        return
+    objects = r.get("objects", [])
+    if not objects:
+        keyboard = [[InlineKeyboardButton("🔙 Back to buckets", callback_data="s3_back")],
+                    [InlineKeyboardButton("🗑 Delete this bucket", callback_data=f"s3_del_bucket|{bucket[:60]}")]]
+        await message.reply_text(
+            f"🪣 *{bucket}* — empty (no objects)",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    page_size = 8
+    start = page * page_size
+    slice_ = objects[start:start + page_size]
+
+    def _fmt_size(b):
+        if b < 1024: return f"{b}B"
+        if b < 1024**2: return f"{b//1024}KB"
+        return f"{b//1024**2}MB"
+
+    keyboard = []
+    for obj in slice_:
+        key = obj["key"]
+        size = _fmt_size(obj["size"])
+        label = key if len(key) <= 30 else "…" + key[-28:]
+        keyboard.append([
+            InlineKeyboardButton(f"📄 {label} ({size})", callback_data=f"s3_obj_info|{bucket[:40]}|{key[:60]}"),
+            InlineKeyboardButton("🗑", callback_data=f"s3_del_obj|{bucket[:40]}|{key[:60]}"),
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅ Prev", callback_data=f"s3_page|{bucket[:60]}|{page-1}"))
+    if start + page_size < len(objects):
+        nav.append(InlineKeyboardButton("Next ➡", callback_data=f"s3_page|{bucket[:60]}|{page+1}"))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton("🗑 Delete entire bucket", callback_data=f"s3_del_bucket|{bucket[:60]}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to buckets", callback_data="s3_back")])
+
+    await message.reply_text(
+        f"🪣 *{bucket}*\n{len(objects)} object(s) — page {page+1}/{(len(objects)-1)//page_size+1}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def cmd_tfstate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     /tfstate list                     — list all projects' state in S3
@@ -2761,6 +2856,80 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.edit_text("❌ Cancelled — your credentials are still saved.")
 
+    # ── S3 browser callbacks ───────────────────────────────────────────────
+    elif data == "s3_back":
+        _gh, aw = _agents(uid)
+        await _s3_show_buckets(query.message, aw)
+
+    elif data.startswith("s3_view|"):
+        bucket = data.split("|", 1)[1]
+        _gh, aw = _agents(uid)
+        await _s3_show_objects(query.message, aw, bucket)
+
+    elif data.startswith("s3_page|"):
+        _, bucket, pg = data.split("|", 2)
+        _gh, aw = _agents(uid)
+        await _s3_show_objects(query.message, aw, bucket, int(pg))
+
+    elif data.startswith("s3_obj_info|"):
+        _, bucket, key = data.split("|", 2)
+        keyboard = [
+            [InlineKeyboardButton("🗑 Delete this object", callback_data=f"s3_del_obj|{bucket}|{key}")],
+            [InlineKeyboardButton("🔙 Back", callback_data=f"s3_view|{bucket}")],
+        ]
+        await query.message.reply_text(
+            f"📄 *Object info*\n\nBucket: `{bucket}`\nKey: `{key}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("s3_del_obj|"):
+        _, bucket, key = data.split("|", 2)
+        keyboard = [
+            [InlineKeyboardButton("✅ Yes, delete object", callback_data=f"s3_del_obj_conf|{bucket}|{key}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"s3_view|{bucket}")],
+        ]
+        await query.message.reply_text(
+            f"⚠️ Delete object?\n\nBucket: `{bucket}`\nKey: `{key}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("s3_del_obj_conf|"):
+        _, bucket, key = data.split("|", 2)
+        _gh, aw = _agents(uid)
+        r = aw.delete_bucket_object(bucket, key)
+        if r.get("status") == "ok":
+            await query.message.edit_text(f"✅ Deleted `{key}` from `{bucket}`.", parse_mode="Markdown")
+        else:
+            await query.message.edit_text(f"❌ Error: {r.get('error')}")
+
+    elif data.startswith("s3_del_bucket|"):
+        bucket = data.split("|", 1)[1]
+        keyboard = [
+            [InlineKeyboardButton("💣 Yes, delete bucket + all objects", callback_data=f"s3_del_bucket_conf|{bucket}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"s3_view|{bucket}")],
+        ]
+        await query.message.reply_text(
+            f"⚠️ *Delete entire bucket?*\n\nBucket: `{bucket}`\n\n"
+            "This will permanently delete ALL objects inside it and the bucket itself.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+    elif data.startswith("s3_del_bucket_conf|"):
+        bucket = data.split("|", 1)[1]
+        _gh, aw = _agents(uid)
+        await query.message.edit_text(f"⏳ Deleting `{bucket}`...", parse_mode="Markdown")
+        r = aw.delete_entire_bucket(bucket)
+        if r.get("status") == "ok":
+            await query.message.reply_text(
+                f"✅ Bucket `{bucket}` deleted.\n{r.get('objects_deleted', 0)} object(s) removed.",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.message.reply_text(f"❌ Error: {r.get('error')}")
+
     elif data == "show_repos":
         gh, aw = _agents(uid)
         r = gh.handle("list_repos", {})
@@ -2867,6 +3036,7 @@ def main():
     app.add_handler(CommandHandler("code",     cmd_code))
     app.add_handler(CommandHandler("github",   cmd_github))
     app.add_handler(CommandHandler("aws",      cmd_aws))
+    app.add_handler(CommandHandler("s3",       cmd_s3))
     app.add_handler(CommandHandler("tfstate",  cmd_tfstate))
     app.add_handler(CommandHandler("skills",   cmd_skills))
     app.add_handler(CommandHandler("addskill", cmd_addskill))

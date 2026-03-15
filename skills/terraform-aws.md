@@ -24,6 +24,11 @@ terraform {
 The pipeline MUST pass: `-backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"`
 This ensures each project/branch gets its own isolated state.
 
+CRITICAL: Always use `terraform init -reconfigure` (never plain `terraform init`) so that
+when the TF_STATE_BUCKET secret changes (e.g. a different AWS account deploys the same repo),
+Terraform ignores any cached `.terraform/backend.tfstate` and uses fresh `-backend-config` values.
+Without `-reconfigure`, Terraform sees a stale backend pointing to the old bucket and throws a 403.
+
 ## GitHub Actions — ALWAYS install Terraform first
 GitHub Actions runners do NOT have Terraform pre-installed.
 Any job that runs terraform commands MUST include this step BEFORE any terraform run step:

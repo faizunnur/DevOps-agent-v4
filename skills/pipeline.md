@@ -43,7 +43,7 @@ This must appear at the workflow level (not inside a job), after `on:` and befor
 - name: Terraform Init
   if: steps.check_ec2.outputs.exists != 'true'
   run: |
-    terraform init \
+    terraform init -reconfigure \
       -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
       -backend-config="region=${{ secrets.AWS_REGION }}" \
       -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"

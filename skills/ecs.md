@@ -182,7 +182,7 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
       - name: Terraform Init
         run: |
-          terraform init \
+          terraform init -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="region=${{ secrets.AWS_REGION }}"
         working-directory: terraform
