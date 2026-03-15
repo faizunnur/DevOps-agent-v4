@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RoyalBengal AI | Emerald Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #020b08; color: #ca5e2f; min-height: 100vh; overflow-x: hidden; font-family: 'Inter', sans-serif; }
+        /* The "Glass" Effect */
+        .glass { 
+            background: rgba(82, 238, 129, 0.03); 
+            backdrop-filter: blur(15px); 
+            border: 1px solid rgba(203, 189, 38, 0.08); 
+            box-shadow: 0 10px 40px -10px rgba(169, 108, 108, 0.5); 
+        }
+        /* Animated Background Orbs */
+        .orb {
+            position: absolute; width: 400px; height: 400px; border-radius: 50%;
+            filter: blur(80px); z-index: -1; opacity: 0.4; animation: float 10s infinite alternate;
+        }
+        @keyframes float { from { transform: translate(0,0); } to { transform: translate(50px, 100px); } }
+    </style>
+</head>
+<body class="flex flex-col items-center">
+    <div class="orb bg-emerald-600 top-[-100px] left-[-100px]"></div>
+    <div class="orb bg-teal-900 bottom-[-100px] right-[-100px]" style="animation-delay: -5s;"></div>
+
+    <nav class="w-full max-w-4xl mt-8 px-6 py-3 flex justify-between items-center glass rounded-2xl sticky top-6 z-50 mx-4">
+        <div class="font-bold text-lg tracking-widest text-emerald-400">ROYAL<span class="text-white">BENGAL</span></div>
+        <div class="hidden md:flex gap-8 text-xs font-medium text-slate-300 uppercase tracking-tighter">
+            <a href="#" class="hover:text-emerald-400 transition">Models</a>
+            <a href="#" class="hover:text-emerald-400 transition">API</a>
+            <a href="#" class="hover:text-emerald-400 transition">Pricing</a>
+        </div>
+        <button class="bg-emerald-500 hover:bg-emerald-400 text-black text-[10px] px-6 py-2 rounded-xl font-black uppercase transition-all shadow-lg shadow-emerald-500/20">Sign Up</button>
+    </nav>
+    
+    <main class="flex-grow flex flex-col items-center justify-center text-center px-6 py-28 w-full">
+        <h1 class="text-6xl md:text-8xl font-bold mb-6 tracking-tighter leading-none">
+            INTELLIGENCE <br><span class="text-transparent bg-clip-text bg-gradient-to-b from-emerald-300 to-emerald-600">REFINED.</span>
+        </h1>
+        <p class="max-w-lg text-slate-400 text-sm md:text-base mb-12 leading-relaxed uppercase tracking-widest">
+            The Emerald standard of Generative AI. <br>Built for speed. Designed for elegance.
+        </p>
+        
+        <div class="grid md:grid-cols-3 gap-6 w-full max-w-5xl">
+            <div class="glass p-10 rounded-[2rem] hover:border-emerald-500/30 transition-all duration-500 group">
+                <div class="w-12 h-12 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition">
+                    <span class="text-emerald-400">⚡</span>
+                </div>
+                <h3 class="font-bold text-lg mb-2">Emerald Core</h3>
+                <p class="text-[12px] text-slate-500 leading-relaxed">Faster token generation with proprietary architecture.</p>
+            </div>
+            <div class="glass p-10 rounded-[2rem] hover:border-emerald-500/30 transition-all duration-500 group">
+                <div class="w-12 h-12 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition">
+                    <span class="text-emerald-400">🛡️</span>
+                </div>
+                <h3 class="font-bold text-lg mb-2">Vault Shield</h3>
+                <p class="text-[12px] text-slate-500 leading-relaxed">State-of-the-art encryption for data sovereign teams.</p>
+            </div>
+            <div class="glass p-10 rounded-[2rem] hover:border-emerald-500/30 transition-all duration-500 group">
+                <div class="w-12 h-12 bg-emerald-500/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition">
+                    <span class="text-emerald-400">🌍</span>
+                </div>
+                <h3 class="font-bold text-lg mb-2">Native South</h3>
+                <p class="text-[12px] text-slate-500 leading-relaxed">Unrivaled support for South Asian linguistic patterns.</p>
+            </div>
+        </div>
+    </main>
+
+    <footer class="mb-12 text-[10px] text-slate-600 uppercase tracking-[0.4em] font-black">© 2026 ROYALBENGAL AI LABS</footer>
+</body>
+</html>
