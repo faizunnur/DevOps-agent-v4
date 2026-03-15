@@ -791,8 +791,59 @@ class Orchestrator:
                     await cb("Destroy succeeded — cleaning up SSM and S3...")
                     aws_agent.delete_ssm_keys(project)
                     aws_agent.delete_s3_state(project)
+                    state.update_deployment(project, status="destroyed")
+                    state.log_step(project, "destroy", "done")
 
                     if delete_repo:
+                        # ── Destroy AWS resources for ALL other branches before deleting repo ──
+                        all_deps = state.list_deployments_by_repo(repo_name)
+                        other_deps = [
+                            d for d in all_deps
+                            if d.get("project") != project and d.get("status") != "destroyed"
+                        ]
+                        if other_deps:
+                            await cb(f"Found {len(other_deps)} other branch(es) with AWS resources — destroying...")
+                        for dep_rec in other_deps:
+                            br_project = dep_rec["project"]
+                            br_branch  = dep_rec.get("branch", "main")
+                            await cb(f"  → Destroying branch '{br_branch}' ({br_project})...")
+                            try:
+                                # Patch terraform files on that branch
+                                br_files = github_agent.get_existing_files(repo_name, branch=br_branch)
+                                _patch_terraform_bucket(br_files, bucket_name, dep_rec.get("region", region))
+                                for fpath, fc in br_files.items():
+                                    if fpath.endswith(".tf"):
+                                        github_agent.push_single_file(
+                                            repo_name, fpath, fc,
+                                            "fix: update terraform backend for full-repo destroy",
+                                            branch=br_branch,
+                                        )
+                                # Trigger destroy pipeline on that branch
+                                trig = github_agent.trigger_pipeline(repo_name, "destroy.yml", branch=br_branch)
+                                if trig.get("status") == "error":
+                                    await cb(f"    Could not trigger destroy for '{br_branch}': {trig.get('error')} — skipping")
+                                    continue
+                                await cb(f"    Pipeline triggered: {trig.get('url', '')}")
+                                br_pipeline = await github_agent.poll_pipeline(
+                                    repo_name,
+                                    interval=30,
+                                    stop_flag=lambda: self.is_stopped(user_id),
+                                    progress_cb=cb,
+                                )
+                                if br_pipeline.get("conclusion") == "success":
+                                    aws_agent.delete_ssm_keys(br_project)
+                                    aws_agent.delete_s3_state(br_project)
+                                    state.update_deployment(br_project, status="destroyed")
+                                    state.log_step(br_project, "destroy", "done")
+                                    await cb(f"    ✓ Branch '{br_branch}' AWS resources destroyed")
+                                else:
+                                    await cb(f"    ⚠ Branch '{br_branch}' destroy pipeline did not succeed — cleaning up state anyway")
+                                    aws_agent.delete_ssm_keys(br_project)
+                                    aws_agent.delete_s3_state(br_project)
+                                    state.update_deployment(br_project, status="destroyed")
+                            except Exception as e_br:
+                                await cb(f"    ⚠ Error destroying branch '{br_branch}': {e_br} — continuing")
+
                         await cb("Deleting GitHub repo...")
                         github_agent.cleanup(repo_name, delete_repo=True)
                     elif delete_branch and branch != "main":
@@ -802,8 +853,6 @@ class Orchestrator:
                         except Exception as e:
                             await cb(f"Could not delete branch: {e}")
 
-                    state.update_deployment(project, status="destroyed")
-                    state.log_step(project, "destroy", "done")
                     return {"status": "success", "message": f"Destroyed {project}"}
 
                 # Pipeline failed — auto fix and retry

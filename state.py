@@ -93,6 +93,15 @@ def get_deployment_by_repo(repo):
         return dict(row) if row else None
 
 
+def list_deployments_by_repo(repo):
+    """Return all deployment records for a given repo (all branches)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM deployments WHERE repo=? ORDER BY updated_at DESC", (repo,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def list_projects():
     with _conn() as conn:
         rows = conn.execute("SELECT project, status, ec2_ip FROM deployments ORDER BY created_at DESC").fetchall()
